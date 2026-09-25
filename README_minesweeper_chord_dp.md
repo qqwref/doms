@@ -56,6 +56,29 @@ You can also pass only the parameter portion:
 python minesweeper_chord_dp.py "b=43&m=g20"
 ```
 
+### Generate a random standard board
+
+Use `--generate` without a board argument to uniformly choose the standard
+number of mines and immediately solve the result:
+
+```console
+python minesweeper_chord_dp.py --generate intermediate
+python minesweeper_chord_dp.py --generate expert --progress
+```
+
+Intermediate generates a 16x16 board with 40 mines; Expert generates a 30x16
+board with 99 mines. The program prints a LlamaSweeper board-editor URL and the
+effective random seed to standard error before solving. Supply a seed to
+reproduce a board exactly:
+
+```console
+python minesweeper_chord_dp.py --generate intermediate --seed 8675309
+```
+
+Printing generation information to standard error keeps `--json` and
+`--click-tuples` machine-readable on standard output. JSON output also includes
+the difficulty, seed, and URL in its `generated_board` field.
+
 ### MBF hexadecimal or file
 
 Pass hexadecimal in quotes:
@@ -93,6 +116,8 @@ Useful options:
 
 ```console
 python minesweeper_chord_dp.py board.txt --json
+python minesweeper_chord_dp.py --generate intermediate --seed 8675309
+python minesweeper_chord_dp.py --generate expert --progress
 python minesweeper_chord_dp.py board.txt --click-tuples
 python minesweeper_chord_dp.py board.txt --verify
 python minesweeper_chord_dp.py board.txt --order rows

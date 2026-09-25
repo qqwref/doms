@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import random
 import re
 import sys
 from collections import deque
@@ -187,6 +188,60 @@ def parse_llamasweeper(source: str) -> tuple[int, int, set[Coord]]:
         if bit == "1"
     }
     return height, width, mines
+
+
+def format_llamasweeper_url(height: int, width: int, mines: set[Coord]) -> str:
+    """Encode a standard board as a LlamaSweeper board-editor URL."""
+    board_codes = {(9, 9): "1", (16, 16): "2", (16, 30): "3"}
+    try:
+        board_code = board_codes[(height, width)]
+    except KeyError as exc:
+        raise ValueError(
+            "LlamaSweeper URL output currently supports only Beginner, "
+            "Intermediate, and Expert dimensions"
+        ) from exc
+    invalid = sorted(
+        cell
+        for cell in mines
+        if not (0 <= cell[0] < height and 0 <= cell[1] < width)
+    )
+    if invalid:
+        raise ValueError(f"mine {invalid[0]} is outside the {width}x{height} board")
+    bits = "".join(
+        "1" if (index // width, index % width) in mines else "0"
+        for index in range(height * width)
+    )
+    bits += "0" * (-len(bits) % 5)
+    mine_code = "".join(
+        LLAMASWEEPER_ALPHABET[int(bits[position : position + 5], 2)]
+        for position in range(0, len(bits), 5)
+    )
+    return (
+        "https://llamasweeper.com/#/game/board-editor?"
+        f"b={board_code}&m={mine_code}"
+    )
+
+
+def generate_standard_board(
+    difficulty: str, seed: int | None = None
+) -> tuple[int, int, set[Coord], str, int]:
+    """Generate a reproducible uniformly random Intermediate or Expert board."""
+    presets = {
+        "intermediate": (16, 16, 40),
+        "expert": (16, 30, 99),
+    }
+    try:
+        height, width, mine_count = presets[difficulty]
+    except KeyError as exc:
+        raise ValueError(f"unknown generated difficulty {difficulty!r}") from exc
+    effective_seed = (
+        random.SystemRandom().getrandbits(64) if seed is None else seed
+    )
+    rng = random.Random(effective_seed)
+    mine_indices = rng.sample(range(height * width), mine_count)
+    mines = {(index // width, index % width) for index in mine_indices}
+    url = format_llamasweeper_url(height, width, mines)
+    return height, width, mines, url, effective_seed
 
 
 def _looks_like_mbf_hex(text: str) -> bool:
@@ -1082,7 +1137,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "board",
+        nargs="?",
         help="grid filename, LlamaSweeper URL, MBF filename, or quoted MBF hex",
+    )
+    parser.add_argument(
+        "--generate",
+        choices=("intermediate", "expert"),
+        help="generate a random standard board, print its URL, and solve it",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="random seed for --generate (an effective seed is printed if omitted)",
     )
     parser.add_argument(
         "--format",
@@ -1129,7 +1195,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        height, width, mines = load_board(args.board, args.format)
+        generated_url: str | None = None
+        generated_seed: int | None = None
+        if args.generate is not None:
+            if args.board is not None:
+                parser.error("do not supply a board argument with --generate")
+            if args.format != "auto":
+                parser.error("--format cannot be used with --generate")
+            height, width, mines, generated_url, generated_seed = (
+                generate_standard_board(args.generate, args.seed)
+            )
+            print(f"Generated board: {generated_url}", file=sys.stderr, flush=True)
+            print(f"Random seed: {generated_seed}", file=sys.stderr, flush=True)
+        else:
+            if args.board is None:
+                parser.error("a board argument or --generate is required")
+            if args.seed is not None:
+                parser.error("--seed requires --generate")
+            height, width, mines = load_board(args.board, args.format)
         model = build_model(height, width, mines)
         if args.method == "bruteforce":
             solution = solve_bruteforce(model)
@@ -1157,6 +1240,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(click_tuples(solution, offset))
         return 0
     data = solution_as_dict(model, solution, offset)
+    if generated_url is not None:
+        data["generated_board"] = {
+            "difficulty": args.generate,
+            "seed": generated_seed,
+            "url": generated_url,
+        }
     if args.json:
         print(json.dumps(data, indent=2))
         return 0

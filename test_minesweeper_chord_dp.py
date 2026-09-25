@@ -1,12 +1,17 @@
 import io
 import random
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
 
 from minesweeper_chord_dp import (
     Solution,
     build_model,
     click_tuples,
+    format_llamasweeper_url,
+    generate_standard_board,
     load_board,
+    main,
     parse_board,
     parse_llamasweeper,
     parse_mbf,
@@ -90,6 +95,52 @@ class ChordDpTests(unittest.TestCase):
         )
         self.assertEqual(parse_llamasweeper("b=411&m=000000000"), (11, 4, set()))
         self.assertEqual(parse_llamasweeper("b=1104&m=000000000"), (4, 11, set()))
+
+    def test_generate_standard_boards(self):
+        for difficulty, dimensions, mine_count, board_code in (
+            ("intermediate", (16, 16), 40, "b=2&"),
+            ("expert", (16, 30), 99, "b=3&"),
+        ):
+            generated = generate_standard_board(difficulty, seed=123456)
+            height, width, mines, url, seed = generated
+            self.assertEqual((height, width), dimensions)
+            self.assertEqual(len(mines), mine_count)
+            self.assertEqual(seed, 123456)
+            self.assertIn(board_code, url)
+            self.assertEqual(parse_llamasweeper(url), (height, width, mines))
+            self.assertEqual(
+                format_llamasweeper_url(height, width, mines),
+                url,
+            )
+            self.assertEqual(
+                generate_standard_board(difficulty, seed=123456),
+                generated,
+            )
+
+    def test_generate_cli_prints_url_then_solves(self):
+        fake_solution = Solution(
+            clicks=0,
+            selected=set(),
+            flags=set(),
+            components=[],
+            uncovered_units=[],
+            actions=[],
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch(
+            "minesweeper_chord_dp.solve_frontier", return_value=fake_solution
+        ) as solve, redirect_stdout(stdout), redirect_stderr(stderr):
+            result = main(
+                ["--generate", "intermediate", "--seed", "8675309", "--click-tuples"]
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(stdout.getvalue().strip(), "[]")
+        self.assertIn("https://llamasweeper.com/#/game/board-editor?b=2&m=", stderr.getvalue())
+        self.assertIn("Random seed: 8675309", stderr.getvalue())
+        generated_model = solve.call_args.args[0]
+        self.assertEqual((generated_model.height, generated_model.width), (16, 16))
+        self.assertEqual(len(generated_model.mines), 40)
 
     def test_mbf_hex(self):
         code = "1e 10 00 08 10 03 0a 05 15 06 11 08 0a 09 19 0a 15 0c 1d 0e"
