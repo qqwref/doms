@@ -14,6 +14,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <queue>
@@ -664,46 +665,80 @@ static std::pair<Model, std::string> choose_order(const Model& model,
     return {ordered_model(model, best->order), best->name};
 }
 
-struct Bits {
-    std::vector<uint64_t> words;
+// Most standard-board states need at most four words. Keeping those words in
+// the object avoids millions of tiny heap allocations in the DP hash tables.
+class Bits {
+public:
+    static constexpr size_t INLINE_WORDS = 4;
+
     Bits() = default;
-    explicit Bits(size_t count) : words(count, 0) {}
-    bool operator==(const Bits& other) const { return words == other.words; }
+    explicit Bits(size_t count) : size_(count) {
+        if (size_ > INLINE_WORDS) heap_ = std::make_unique<uint64_t[]>(size_);
+    }
+    Bits(const Bits& other) : Bits(other.size_) {
+        std::copy_n(other.data(), size_, data());
+    }
+    Bits& operator=(const Bits& other) {
+        if (this == &other) return *this;
+        if (size_ != other.size_) {
+            size_ = other.size_;
+            heap_.reset();
+            if (size_ > INLINE_WORDS) heap_ = std::make_unique<uint64_t[]>(size_);
+        }
+        std::copy_n(other.data(), size_, data());
+        return *this;
+    }
+    Bits(Bits&&) noexcept = default;
+    Bits& operator=(Bits&&) noexcept = default;
+
+    size_t size() const { return size_; }
+    uint64_t* data() { return size_ > INLINE_WORDS ? heap_.get() : inline_.data(); }
+    const uint64_t* data() const { return size_ > INLINE_WORDS ? heap_.get() : inline_.data(); }
+    uint64_t& operator[](size_t index) { return data()[index]; }
+    uint64_t operator[](size_t index) const { return data()[index]; }
+    bool operator==(const Bits& other) const {
+        return size_ == other.size_ && std::equal(data(), data() + size_, other.data());
+    }
+
+private:
+    size_t size_ = 0;
+    std::array<uint64_t, INLINE_WORDS> inline_{};
+    std::unique_ptr<uint64_t[]> heap_;
 };
 
 static void set_bit(Bits& bits, int position) {
-    bits.words[position / 64] |= uint64_t{1} << (position % 64);
+    bits[position / 64] |= uint64_t{1} << (position % 64);
 }
 
 static bool test_bit(const Bits& bits, int position) {
-    return (bits.words[position / 64] >> (position % 64)) & 1U;
+    return (bits[position / 64] >> (position % 64)) & 1U;
 }
 
 static int bit_count(const Bits& bits) {
     int count = 0;
-    for (uint64_t word : bits.words) count += __builtin_popcountll(word);
+    for (size_t i = 0; i < bits.size(); ++i) count += __builtin_popcountll(bits[i]);
     return count;
 }
 
 static int bit_count_and(const Bits& a, const Bits& b) {
     int count = 0;
-    for (size_t i = 0; i < a.words.size(); ++i) {
-        count += __builtin_popcountll(a.words[i] & b.words[i]);
+    for (size_t i = 0; i < a.size(); ++i) {
+        count += __builtin_popcountll(a[i] & b[i]);
     }
     return count;
 }
 
 static int bit_count_new_and(const Bits& member, const Bits& old, const Bits& filter) {
     int count = 0;
-    for (size_t i = 0; i < member.words.size(); ++i) {
-        count += __builtin_popcountll(member.words[i] & ~old.words[i] & filter.words[i]);
+    for (size_t i = 0; i < member.size(); ++i) {
+        count += __builtin_popcountll(member[i] & ~old[i] & filter[i]);
     }
     return count;
 }
 
 static bool is_superset(const Bits& candidate, const Bits& other) {
-    for (size_t i = 0; i < candidate.words.size(); ++i) {
-        if ((candidate.words[i] | other.words[i]) != candidate.words[i]) return false;
+    for (size_t i = 0; i < candidate.size(); ++i) {
+        if ((candidate[i] | other[i]) != candidate[i]) return false;
     }
     return true;
 }
@@ -725,16 +760,55 @@ struct LabelsHash {
     }
 };
 
+// Boundary partitions repeat across many factor-hit masks. Intern them once
+// per layer so a state key contains a 32-bit ID instead of an allocated vector.
+class LabelPool {
+public:
+    LabelPool() { intern({}); }
+
+    uint32_t intern(std::vector<uint16_t> labels) {
+        auto found = ids_.find(labels);
+        if (found != ids_.end()) return found->second;
+        const uint32_t id = static_cast<uint32_t>(by_id_.size());
+        auto inserted = ids_.emplace(std::move(labels), id).first;
+        by_id_.push_back(&inserted->first);
+        return id;
+    }
+
+    const std::vector<uint16_t>& operator[](uint32_t id) const { return *by_id_[id]; }
+    size_t size() const { return by_id_.size(); }
+    void reserve(size_t count) {
+        ids_.reserve(count);
+        by_id_.reserve(count);
+    }
+    void reset(size_t reserve_count = 0) {
+        ids_.clear();
+        by_id_.clear();
+        reserve(reserve_count);
+        intern({});
+    }
+    void swap(LabelPool& other) noexcept {
+        ids_.swap(other.ids_);
+        by_id_.swap(other.by_id_);
+    }
+
+private:
+    std::unordered_map<std::vector<uint16_t>, uint32_t, LabelsHash> ids_;
+    std::vector<const std::vector<uint16_t>*> by_id_;
+};
+
 struct State {
-    std::vector<uint16_t> labels;
+    uint32_t label_id = 0;
     Bits hits;
-    bool operator==(const State& other) const { return labels == other.labels && hits == other.hits; }
+    bool operator==(const State& other) const {
+        return label_id == other.label_id && hits == other.hits;
+    }
 };
 
 struct StateHash {
     size_t operator()(const State& state) const {
-        size_t hash = LabelsHash{}(state.labels);
-        for (uint64_t word : state.hits.words) hash = hash_combine(hash, word);
+        size_t hash = hash_combine(0, state.label_id);
+        for (size_t i = 0; i < state.hits.size(); ++i) hash = hash_combine(hash, state.hits[i]);
         return hash;
     }
 };
@@ -758,23 +832,25 @@ static std::vector<uint16_t> canonical_tokens(std::vector<uint16_t> tokens, int 
 }
 
 struct ConnectivityTransition {
-    std::vector<uint16_t> labels;
+    uint32_t label_id = 0;
     int closed = 0;
 };
 
 static std::pair<Table, size_t> prune_dominated(Table&& table,
                                                  uint64_t comparison_limit,
-                                                 const Bits& base_mask) {
+                                                 const Bits& base_mask,
+                                                 size_t label_count) {
     if (comparison_limit == 0 || table.size() < 2) return {std::move(table), 0};
     using Item = const Table::value_type*;
-    std::unordered_map<std::vector<uint16_t>, std::vector<Item>, LabelsHash> groups;
-    groups.reserve(table.size());
-    for (const auto& entry : table) groups[entry.first.labels].push_back(&entry);
+    std::vector<std::vector<Item>> groups(label_count);
+    for (const auto& entry : table) groups[entry.first.label_id].push_back(&entry);
     Table result;
+    result.max_load_factor(0.8f);
     result.reserve(table.size());
     size_t removed = 0;
     uint64_t remaining = comparison_limit;
-    for (auto& [labels, entries] : groups) {
+    for (auto& entries : groups) {
+        if (entries.empty()) continue;
         if (entries.size() == 1) {
             result.emplace(entries[0]->first, entries[0]->second);
             continue;
@@ -919,8 +995,11 @@ static Solution solve_frontier(const Model& original_model,
     const auto region_ranks = progress ? ordered_region_ranks(model, order_name) : std::vector<int>{};
 
     Table table;
+    table.max_load_factor(0.8f);
     table.reserve(1024);
-    table.emplace(State{{}, Bits(factor_words)}, Record{model.three_bv(), Bits(chosen_words)});
+    table.emplace(State{0, Bits(factor_words)}, Record{model.three_bv(), Bits(chosen_words)});
+    LabelPool label_pool;
+    LabelPool next_label_pool;
     size_t peak_states = 1;
     int max_boundary = 0;
     int max_active = 0;
@@ -953,25 +1032,26 @@ static Solution solve_frontier(const Model& original_model,
         }
 
         Table next;
+        next.max_load_factor(0.8f);
         const size_t desired_capacity = table.size() > (std::numeric_limits<size_t>::max() - 16) / 2
             ? std::numeric_limits<size_t>::max() : table.size() * 2 + 16;
         const size_t state_capacity = max_states == std::numeric_limits<size_t>::max()
             ? desired_capacity : std::min(max_states + 1, desired_capacity);
         next.reserve(state_capacity);
-        std::unordered_map<std::vector<uint16_t>,
-                           std::array<ConnectivityTransition, 2>, LabelsHash> connectivity_cache;
-        connectivity_cache.reserve(table.size() / 4 + 16);
+        next_label_pool.reset(label_pool.size() * 2 + 16);
+        std::vector<std::array<ConnectivityTransition, 2>> connectivity_cache(label_pool.size());
+        std::vector<uint8_t> connectivity_ready(label_pool.size(), 0);
         for (const auto& [old_state, old_record] : table) {
-            auto cache_it = connectivity_cache.find(old_state.labels);
-            if (cache_it == connectivity_cache.end()) {
+            if (!connectivity_ready[old_state.label_id]) {
+                const auto& old_labels = label_pool[old_state.label_id];
                 std::array<ConnectivityTransition, 2> computed;
-                const int largest_old = old_state.labels.empty()
-                    ? 0 : *std::max_element(old_state.labels.begin(), old_state.labels.end());
+                const int largest_old = old_labels.empty()
+                    ? 0 : *std::max_element(old_labels.begin(), old_labels.end());
                 for (int selected = 0; selected <= 1; ++selected) {
                     std::vector<uint8_t> merged(largest_old + 2, 0);
                     if (selected) {
                         for (int position : touch_positions) {
-                            const uint16_t label = old_state.labels[position];
+                            const uint16_t label = old_labels[position];
                             if (label) merged[label] = 1;
                         }
                     }
@@ -985,7 +1065,7 @@ static Solution solve_frontier(const Model& original_model,
                     std::vector<uint16_t> outgoing;
                     outgoing.reserve(new_boundary.size());
                     for (int source : source_positions) {
-                        outgoing.push_back(source >= 0 ? old_state.labels[source] : 0);
+                        outgoing.push_back(source >= 0 ? old_labels[source] : 0);
                     }
                     if (selected) {
                         for (uint16_t& token : outgoing) {
@@ -1009,11 +1089,12 @@ static Solution solve_frontier(const Model& original_model,
                     for (int label = 1; label < static_cast<int>(all.size()); ++label) {
                         if (all[label] && !represented[label]) ++closed;
                     }
-                    computed[selected] = {
-                        canonical_tokens(std::move(outgoing), std::max(largest_old, current_token)),
-                        closed};
+                    auto canonical = canonical_tokens(
+                        std::move(outgoing), std::max(largest_old, current_token));
+                    computed[selected] = {next_label_pool.intern(std::move(canonical)), closed};
                 }
-                cache_it = connectivity_cache.emplace(old_state.labels, std::move(computed)).first;
+                connectivity_cache[old_state.label_id] = std::move(computed);
+                connectivity_ready[old_state.label_id] = 1;
             }
 
             for (int selected = 0; selected <= 1; ++selected) {
@@ -1023,17 +1104,17 @@ static Solution solve_frontier(const Model& original_model,
                     factor_cost += bit_count_new_and(factor_member[i], old_state.hits, flag_mask);
                     factor_cost -= bit_count_new_and(factor_member[i], old_state.hits, base_mask);
                     for (size_t word = 0; word < factor_words; ++word) {
-                        new_hits.words[word] |= factor_member[i].words[word];
+                        new_hits[word] |= factor_member[i][word];
                     }
                 }
                 for (size_t word = 0; word < factor_words; ++word) {
-                    new_hits.words[word] &= active_after[i].words[word];
+                    new_hits[word] &= active_after[i][word];
                 }
-                const auto& connection = cache_it->second[selected];
+                const auto& connection = connectivity_cache[old_state.label_id][selected];
                 const int new_cost = old_record.cost + selected + connection.closed + factor_cost;
                 Bits new_chosen = old_record.chosen;
                 if (selected) set_bit(new_chosen, i);
-                State state{connection.labels, std::move(new_hits)};
+                State state{connection.label_id, std::move(new_hits)};
                 auto found = next.find(state);
                 if (found == next.end()) {
                     next.emplace(std::move(state), Record{new_cost, std::move(new_chosen)});
@@ -1042,8 +1123,10 @@ static Solution solve_frontier(const Model& original_model,
                 }
             }
         }
-        auto [pruned, removed] = prune_dominated(std::move(next), dominance_comparisons, base_mask);
+        auto [pruned, removed] = prune_dominated(
+            std::move(next), dominance_comparisons, base_mask, next_label_pool.size());
         table = std::move(pruned);
+        label_pool.swap(next_label_pool);
         dominated_total += removed;
         peak_states = std::max(peak_states, table.size());
         max_boundary = std::max(max_boundary, static_cast<int>(new_boundary.size()));
@@ -1064,7 +1147,7 @@ static Solution solve_frontier(const Model& original_model,
         }
     }
 
-    State final_state{{}, Bits(factor_words)};
+    State final_state{0, Bits(factor_words)};
     auto final = table.find(final_state);
     if (final == table.end()) throw std::logic_error("frontier DP did not reach an empty final state");
     std::vector<int> selected;

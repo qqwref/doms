@@ -53,12 +53,22 @@ same layout as the Python program given the same numeric seed because the two
 implementations use different pseudorandom generators. The printed URL is an
 implementation-independent way to preserve and rerun a particular board.
 
-In validation here, the C++ port matched brute force on 250 randomized small
-boards and matched the Python solver's optimum and peak state count on larger
-boards. The supplied LlamaSweeper example took about 0.7 seconds in C++ versus
-about 2.2 seconds in Python in the same run. A harder Intermediate board took
-about 4.6 seconds in C++ versus roughly 34 seconds in an earlier Python run.
-Exact timings depend strongly on the board and machine.
+In validation here, the C++ port matched brute force on randomized small boards
+and matched the Python solver's optimum on larger boards. The implementation
+interns repeated boundary partitions once per DP layer and stores the common
+small bitsets inline, so state insertion and copying do not perform heap
+allocations on standard Intermediate boards. On the roughly 1.3-million-state
+test board below, those representation changes reduced the solve time from
+100.47 seconds to 49.00 seconds in the same environment while retaining the
+52-click optimum:
+
+```text
+https://llamasweeper.com/#/game/board-editor?b=2&m=000g14s0010421g080414h4540a0g8880kg200800080o5400c00
+```
+
+The earlier supplied LlamaSweeper example took about 0.7 seconds in C++ versus
+about 2.2 seconds in Python in the same run. Exact timings depend strongly on
+the board, compiler, and machine.
 
 C++ removes much of the interpreter overhead, but it does not change the
 algorithm's exponential worst case. In particular, some Expert boards can
@@ -239,9 +249,11 @@ are merged, retaining only the cheapest partial chord set.
 
 All 3BV units, direct chord adjacency, zero-opening membership, and mine/3BV
 factor membership are precomputed. Hot transitions use integer bitsets and
-`bit_count()` rather than allocating factor objects or dictionaries. A cached
-connectivity transition is shared by all states having the same boundary
-partition.
+`bit_count()` rather than allocating factor objects or dictionaries. Bitsets up
+to four machine words use inline storage. A cached connectivity transition is
+shared by all states having the same boundary partition, and each distinct
+partition is interned once per layer; hash-table state keys carry only its
+integer ID.
 
 The DP also performs exact Pareto pruning. For equal connectivity, a state can
 be discarded when another state has a superset of future-useful hits at a
