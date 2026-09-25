@@ -771,13 +771,13 @@ struct WordsHash {
 // state needs only a 32-bit ID.
 class ConnectivityPool {
 public:
-    ConnectivityPool() { intern({}); }
+    ConnectivityPool() { intern(std::vector<uint64_t>{}); }
 
-    uint32_t intern(std::vector<uint64_t> signature) {
+    uint32_t intern(const std::vector<uint64_t>& signature) {
         auto found = ids_.find(signature);
         if (found != ids_.end()) return found->second;
         const uint32_t id = static_cast<uint32_t>(by_id_.size());
-        auto inserted = ids_.emplace(std::move(signature), id).first;
+        auto inserted = ids_.emplace(signature, id).first;
         by_id_.push_back(&inserted->first);
         return id;
     }
@@ -792,7 +792,7 @@ public:
         ids_.clear();
         by_id_.clear();
         reserve(reserve_count);
-        intern({});
+        intern(std::vector<uint64_t>{});
     }
     void swap(ConnectivityPool& other) noexcept {
         ids_.swap(other.ids_);
@@ -825,7 +825,199 @@ struct Record {
     Bits chosen;
 };
 
-using Table = std::unordered_map<State, Record, StateHash>;
+// The DP creates a fresh table for each layer, fills it, then only erases from
+// it during dominance pruning. Store values densely and keep a compact open-
+// addressed index alongside them. This avoids one allocation and one pointer
+// chase per state while preserving stable dense-entry indexes during pruning.
+class Table {
+public:
+    using value_type = std::pair<State, Record>;
+
+    class iterator {
+    public:
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = Table::value_type;
+        using difference_type = std::ptrdiff_t;
+        using pointer = value_type*;
+        using reference = value_type&;
+
+        iterator() = default;
+        reference operator*() const { return owner_->entries_[index_]; }
+        pointer operator->() const { return &owner_->entries_[index_]; }
+        iterator& operator++() {
+            ++index_;
+            skip_dead();
+            return *this;
+        }
+        iterator operator++(int) {
+            iterator copy = *this;
+            ++*this;
+            return copy;
+        }
+        bool operator==(const iterator& other) const {
+            return owner_ == other.owner_ && index_ == other.index_;
+        }
+        bool operator!=(const iterator& other) const { return !(*this == other); }
+
+    private:
+        friend class Table;
+        iterator(Table* owner, size_t index) : owner_(owner), index_(index) { skip_dead(); }
+        void skip_dead() {
+            if (owner_ == nullptr) return;
+            while (index_ < owner_->entries_.size() && !owner_->alive_[index_]) ++index_;
+        }
+
+        Table* owner_ = nullptr;
+        size_t index_ = 0;
+    };
+
+    Table() = default;
+    Table(Table&&) noexcept = default;
+    Table& operator=(Table&&) noexcept = default;
+    Table(const Table&) = delete;
+    Table& operator=(const Table&) = delete;
+
+    size_t size() const { return live_size_; }
+    bool empty() const { return live_size_ == 0; }
+    iterator begin() { return iterator(this, 0); }
+    iterator end() { return iterator(this, entries_.size()); }
+
+    void reserve(size_t count) {
+        if (count > static_cast<size_t>(DELETED) - 1) {
+            throw std::length_error("too many DP states for the flat table");
+        }
+        entries_.reserve(count);
+        alive_.reserve(count);
+        size_t capacity = 8;
+        while (capacity - capacity / 4 < count) {
+            if (capacity > std::numeric_limits<size_t>::max() / 2) {
+                throw std::length_error("DP hash table capacity overflow");
+            }
+            capacity *= 2;
+        }
+        if (capacity > slots_.size()) rehash(capacity);
+    }
+
+    iterator find(const State& state) {
+        if (slots_.empty()) {
+            for (size_t index = 0; index < entries_.size(); ++index) {
+                if (alive_[index] && entries_[index].first == state) {
+                    return iterator(this, index);
+                }
+            }
+            return end();
+        }
+        const size_t mask = slots_.size() - 1;
+        size_t slot = StateHash{}(state) & mask;
+        for (;;) {
+            const uint32_t entry = slots_[slot];
+            if (entry == EMPTY) return end();
+            if (entry != DELETED && alive_[entry] && entries_[entry].first == state) {
+                return iterator(this, entry);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    // Callers use find() first when duplicates are possible, so this insertion
+    // path deliberately avoids a second equality scan.
+    std::pair<iterator, bool> emplace(State state, Record record) {
+        ensure_insert_capacity();
+        const size_t entry_index = entries_.size();
+        entries_.emplace_back(std::move(state), std::move(record));
+        alive_.push_back(1);
+
+        const size_t mask = slots_.size() - 1;
+        size_t slot = StateHash{}(entries_.back().first) & mask;
+        size_t first_deleted = std::numeric_limits<size_t>::max();
+        for (;;) {
+            if (slots_[slot] == EMPTY) {
+                if (first_deleted != std::numeric_limits<size_t>::max()) {
+                    slot = first_deleted;
+                    --deleted_slots_;
+                } else {
+                    ++used_slots_;
+                }
+                slots_[slot] = static_cast<uint32_t>(entry_index);
+                ++live_size_;
+                return {iterator(this, entry_index), true};
+            }
+            if (slots_[slot] == DELETED &&
+                first_deleted == std::numeric_limits<size_t>::max()) {
+                first_deleted = slot;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    void erase(iterator where) {
+        const size_t entry_index = where.index_;
+        if (entry_index >= entries_.size() || !alive_[entry_index]) return;
+        const size_t mask = slots_.size() - 1;
+        size_t slot = StateHash{}(entries_[entry_index].first) & mask;
+        while (slots_[slot] != EMPTY) {
+            if (slots_[slot] == entry_index) {
+                slots_[slot] = DELETED;
+                ++deleted_slots_;
+                alive_[entry_index] = 0;
+                --live_size_;
+                // Inline words occupy the dense slot regardless, but release
+                // any wide-board overflow allocations immediately.
+                if (entries_[entry_index].first.hits.size() > Bits::INLINE_WORDS) {
+                    entries_[entry_index].first.hits = Bits{};
+                }
+                if (entries_[entry_index].second.chosen.size() > Bits::INLINE_WORDS) {
+                    entries_[entry_index].second.chosen = Bits{};
+                }
+                return;
+            }
+            slot = (slot + 1) & mask;
+        }
+        throw std::logic_error("flat DP table lost an indexed state");
+    }
+
+    void swap(Table& other) noexcept {
+        entries_.swap(other.entries_);
+        alive_.swap(other.alive_);
+        slots_.swap(other.slots_);
+        std::swap(live_size_, other.live_size_);
+        std::swap(used_slots_, other.used_slots_);
+        std::swap(deleted_slots_, other.deleted_slots_);
+    }
+
+private:
+    static constexpr uint32_t EMPTY = std::numeric_limits<uint32_t>::max();
+    static constexpr uint32_t DELETED = EMPTY - 1;
+
+    void ensure_insert_capacity() {
+        if (slots_.empty()) {
+            rehash(8);
+        } else if ((used_slots_ + 1) * 4 > slots_.size() * 3) {
+            rehash(slots_.size() * 2);
+        }
+    }
+
+    void rehash(size_t capacity) {
+        std::vector<uint32_t> replacement(capacity, EMPTY);
+        const size_t mask = capacity - 1;
+        for (size_t index = 0; index < entries_.size(); ++index) {
+            if (!alive_[index]) continue;
+            size_t slot = StateHash{}(entries_[index].first) & mask;
+            while (replacement[slot] != EMPTY) slot = (slot + 1) & mask;
+            replacement[slot] = static_cast<uint32_t>(index);
+        }
+        slots_.swap(replacement);
+        used_slots_ = live_size_;
+        deleted_slots_ = 0;
+    }
+
+    std::vector<value_type> entries_;
+    std::vector<uint8_t> alive_;
+    std::vector<uint32_t> slots_;
+    size_t live_size_ = 0;
+    size_t used_slots_ = 0;
+    size_t deleted_slots_ = 0;
+};
 
 struct ConnectivityTransition {
     uint32_t connectivity_id = 0;
@@ -1221,8 +1413,7 @@ static Solution solve_frontier(const Model& original_model,
     const auto region_ranks = progress ? ordered_region_ranks(model, order_name) : std::vector<int>{};
 
     Table table;
-    table.max_load_factor(0.8f);
-    table.reserve(1024);
+    table.reserve(16);
     table.emplace(State{0, Bits(factor_words)}, Record{model.three_bv(), Bits(chosen_words)});
     ConnectivityPool connectivity_pool;
     ConnectivityPool next_connectivity_pool;
@@ -1235,7 +1426,6 @@ static Solution solve_frontier(const Model& original_model,
         const auto& new_boundary = boundaries[i + 1];
 
         Table next;
-        next.max_load_factor(0.8f);
         const size_t desired_capacity = table.size() > (std::numeric_limits<size_t>::max() - 16) / 2
             ? std::numeric_limits<size_t>::max() : table.size() * 2 + 16;
         const size_t state_capacity = max_states == std::numeric_limits<size_t>::max()
@@ -1246,15 +1436,26 @@ static Solution solve_frontier(const Model& original_model,
             std::vector<std::array<ConnectivityTransition, 2>> connectivity_cache(
                 connectivity_pool.size());
             std::vector<uint8_t> connectivity_ready(connectivity_pool.size(), 0);
+            // Reuse flat scratch buffers for every connectivity transition in
+            // this layer. Component offsets remain valid if the word buffer
+            // grows, unlike pointers into a vector.
+            std::vector<uint64_t> outgoing_words;
+            std::vector<size_t> outgoing_offsets;
+            std::vector<uint64_t> merged(chosen_words);
+            std::vector<uint64_t> canonical;
             for (const auto& [old_state, old_record] : table) {
                 if (!connectivity_ready[old_state.connectivity_id]) {
                     const auto& old_signature = connectivity_pool[old_state.connectivity_id];
                     std::array<ConnectivityTransition, 2> computed;
                     for (int selected = 0; selected <= 1; ++selected) {
                         int closed = 0;
-                        std::vector<std::vector<uint64_t>> outgoing;
-                        outgoing.reserve(old_signature.size() / chosen_words + selected);
-                        std::vector<uint64_t> merged(chosen_words, 0);
+                        outgoing_words.clear();
+                        outgoing_offsets.clear();
+                        std::fill(merged.begin(), merged.end(), 0);
+                        outgoing_words.reserve(old_signature.size() +
+                                               selected * chosen_words);
+                        outgoing_offsets.reserve(old_signature.size() / chosen_words +
+                                                 selected);
                         if (selected) {
                             for (size_t word = 0; word < chosen_words; ++word) {
                                 merged[word] = future_neighbors[i][word];
@@ -1270,33 +1471,54 @@ static Solution solve_frontier(const Model& original_model,
                                 }
                                 continue;
                             }
-                            std::vector<uint64_t> component(
-                                old_signature.begin() + static_cast<std::ptrdiff_t>(offset),
-                                old_signature.begin() + static_cast<std::ptrdiff_t>(
-                                    offset + chosen_words));
-                            component[i / 64] &= ~(uint64_t{1} << (i % 64));
-                            const bool nonempty = std::any_of(
-                                component.begin(), component.end(),
-                                [](uint64_t word) { return word != 0; });
-                            if (nonempty) outgoing.push_back(std::move(component));
-                            else ++closed;
+                            const size_t start = outgoing_words.size();
+                            bool nonempty = false;
+                            for (size_t word = 0; word < chosen_words; ++word) {
+                                uint64_t value = old_signature[offset + word];
+                                if (word == static_cast<size_t>(i / 64)) {
+                                    value &= ~(uint64_t{1} << (i % 64));
+                                }
+                                outgoing_words.push_back(value);
+                                nonempty = nonempty || value != 0;
+                            }
+                            if (nonempty) outgoing_offsets.push_back(start);
+                            else {
+                                outgoing_words.resize(start);
+                                ++closed;
+                            }
                         }
                         if (selected) {
                             merged[i / 64] &= ~(uint64_t{1} << (i % 64));
                             const bool nonempty = std::any_of(
                                 merged.begin(), merged.end(),
                                 [](uint64_t word) { return word != 0; });
-                            if (nonempty) outgoing.push_back(std::move(merged));
-                            else ++closed;
+                            if (nonempty) {
+                                outgoing_offsets.push_back(outgoing_words.size());
+                                outgoing_words.insert(
+                                    outgoing_words.end(), merged.begin(), merged.end());
+                            } else ++closed;
                         }
-                        std::sort(outgoing.begin(), outgoing.end());
-                        std::vector<uint64_t> canonical;
-                        canonical.reserve(outgoing.size() * chosen_words);
-                        for (auto& component : outgoing) {
-                            canonical.insert(canonical.end(), component.begin(), component.end());
+                        std::sort(outgoing_offsets.begin(), outgoing_offsets.end(),
+                                  [&](size_t a, size_t b) {
+                                      for (size_t word = 0; word < chosen_words; ++word) {
+                                          if (outgoing_words[a + word] !=
+                                              outgoing_words[b + word]) {
+                                              return outgoing_words[a + word] <
+                                                     outgoing_words[b + word];
+                                          }
+                                      }
+                                      return false;
+                                  });
+                        canonical.clear();
+                        canonical.reserve(outgoing_offsets.size() * chosen_words);
+                        for (size_t offset : outgoing_offsets) {
+                            canonical.insert(canonical.end(),
+                                             outgoing_words.begin() +
+                                                 static_cast<std::ptrdiff_t>(offset),
+                                             outgoing_words.begin() +
+                                                 static_cast<std::ptrdiff_t>(offset + chosen_words));
                         }
-                        computed[selected] = {next_connectivity_pool.intern(
-                                                  std::move(canonical)),
+                        computed[selected] = {next_connectivity_pool.intern(canonical),
                                               closed};
                     }
                     connectivity_cache[old_state.connectivity_id] = std::move(computed);
