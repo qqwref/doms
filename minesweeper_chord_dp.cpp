@@ -720,14 +720,6 @@ static int bit_count(const Bits& bits) {
     return count;
 }
 
-static int bit_count_and(const Bits& a, const Bits& b) {
-    int count = 0;
-    for (size_t i = 0; i < a.size(); ++i) {
-        count += __builtin_popcountll(a[i] & b[i]);
-    }
-    return count;
-}
-
 static int bit_count_new_and(const Bits& member, const Bits& old, const Bits& filter) {
     int count = 0;
     for (size_t i = 0; i < member.size(); ++i) {
@@ -736,17 +728,20 @@ static int bit_count_new_and(const Bits& member, const Bits& old, const Bits& fi
     return count;
 }
 
-// Worst extra cost candidate can incur relative to other under the same future
-// chord choices: an unpaid flag, or a 3BV saving that other can still earn.
-static int dominance_penalty(const Bits& candidate, const Bits& other,
-                             const Bits& flag_mask, const Bits& base_mask) {
+// Test whether the candidate's worst extra cost relative to the other state
+// fits within allowance. In "good-bit" form, flag hits and unhit base factors
+// are both desirable, and the penalty is simply good(other) & ~good(candidate).
+// Stop as soon as the candidate can no longer dominate.
+static bool dominance_penalty_at_most(const Bits& candidate, const Bits& other,
+                                      const Bits& base_mask, int allowance) {
     int penalty = 0;
     for (size_t i = 0; i < candidate.size(); ++i) {
-        const uint64_t candidate_lacks_flag = ~candidate[i] & other[i] & flag_mask[i];
-        const uint64_t other_can_gain_base = candidate[i] & ~other[i] & base_mask[i];
-        penalty += __builtin_popcountll(candidate_lacks_flag | other_can_gain_base);
+        const uint64_t candidate_good = candidate[i] ^ base_mask[i];
+        const uint64_t other_good = other[i] ^ base_mask[i];
+        penalty += __builtin_popcountll(other_good & ~candidate_good);
+        if (penalty > allowance) return false;
     }
-    return penalty;
+    return true;
 }
 
 static size_t hash_combine(size_t seed, uint64_t value) {
@@ -1026,12 +1021,6 @@ struct ConnectivityTransition {
 
 using DominanceKey = std::tuple<int, int, int>;
 
-static DominanceKey dominance_order_key(const Table::value_type& item,
-                                        const Bits& base_mask) {
-    return {item.second.cost + bit_count_and(item.first.hits, base_mask),
-            item.second.cost, -bit_count(item.first.hits)};
-}
-
 // A coarser signature can represent several finer components as one, provided
 // every finer component's future reachability is contained in its representative.
 // Requiring every coarse component to represent at least one fine component
@@ -1141,7 +1130,6 @@ static bool connectivity_coarsens(const std::vector<uint64_t>& coarse,
 
 static size_t prune_dominated(Table& table,
                               uint64_t comparison_limit,
-                              const Bits& flag_mask,
                               const Bits& base_mask,
                               const ConnectivityPool& connectivity_pool,
                               size_t signature_words) {
@@ -1150,6 +1138,9 @@ static size_t prune_dominated(Table& table,
     struct CachedItem {
         Item item;
         DominanceKey key;
+        int base_hits = 0;
+        int flag_hits = 0;
+        int quasi_score = 0;
         bool exact_dominated = false;
         bool cross_dominated = false;
     };
@@ -1198,8 +1189,19 @@ static size_t prune_dominated(Table& table,
     }
     for (auto item = table.begin(); item != table.end(); ++item) {
         const size_t bucket = connectivity_bucket[item->first.connectivity_id];
+        int base_hits = 0;
+        int total_hits = 0;
+        for (size_t word = 0; word < item->first.hits.size(); ++word) {
+            const uint64_t hits = item->first.hits[word];
+            base_hits += __builtin_popcountll(hits & base_mask[word]);
+            total_hits += __builtin_popcountll(hits);
+        }
+        const int flag_hits = total_hits - base_hits;
+        const DominanceKey key{
+            item->second.cost + base_hits, item->second.cost, -total_hits};
+        const int quasi_score = item->second.cost + base_hits - flag_hits;
         buckets[bucket].entries.push_back(
-            CachedItem{item, dominance_order_key(*item, base_mask), false, false});
+            CachedItem{item, key, base_hits, flag_hits, quasi_score, false, false});
     }
     for (auto& bucket : buckets) {
         std::sort(bucket.entries.begin(), bucket.entries.end(),
@@ -1210,61 +1212,130 @@ static size_t prune_dominated(Table& table,
 
     uint64_t remaining = comparison_limit;
     std::vector<std::vector<CachedItem*>> survivors(connectivity_count);
+    std::vector<int> minimum_quasi(connectivity_count, std::numeric_limits<int>::max());
+    std::vector<int> maximum_quasi(connectivity_count, std::numeric_limits<int>::min());
     for (uint32_t id = 0; id < connectivity_count; ++id) {
         survivors[id].reserve(state_counts[id]);
     }
+    auto dominates = [&](const CachedItem* candidate, const CachedItem* target) {
+        const int allowance = target->item->second.cost - candidate->item->second.cost;
+        if (allowance < 0) return false;
+        // Count differences give a cheap lower bound on the directed bit
+        // penalty before touching either state's bitset.
+        const int lower_bound =
+            std::max(0, target->flag_hits - candidate->flag_hits) +
+            std::max(0, candidate->base_hits - target->base_hits);
+        if (lower_bound > allowance) return false;
+        return dominance_penalty_at_most(
+            candidate->item->first.hits, target->item->first.hits,
+            base_mask, allowance);
+    };
 
     // First remove factor-dominated states with identical connectivity. The
     // per-ID survivor lists inherit the bucket's cached sort order.
     for (auto& bucket : buckets) {
         for (CachedItem& cached : bucket.entries) {
-            auto& kept = survivors[cached.item->first.connectivity_id];
+            const uint32_t connectivity_id = cached.item->first.connectivity_id;
+            auto& kept = survivors[connectivity_id];
             bool is_dominated = false;
             if (remaining >= kept.size()) {
                 remaining -= kept.size();
                 for (CachedItem* prior : kept) {
-                    if (prior->item->second.cost > cached.item->second.cost) continue;
-                    const int penalty = dominance_penalty(
-                        prior->item->first.hits, cached.item->first.hits,
-                        flag_mask, base_mask);
-                    if (prior->item->second.cost + penalty <= cached.item->second.cost) {
+                    if (dominates(prior, &cached)) {
                         is_dominated = true;
                         break;
                     }
                 }
             }
             cached.exact_dominated = is_dominated;
-            if (!is_dominated) kept.push_back(&cached);
+            if (!is_dominated) {
+                kept.push_back(&cached);
+                minimum_quasi[connectivity_id] =
+                    std::min(minimum_quasi[connectivity_id], cached.quasi_score);
+                maximum_quasi[connectivity_id] =
+                    std::max(maximum_quasi[connectivity_id], cached.quasi_score);
+            }
         }
     }
 
-    // Precompute which signatures can dominate which finer signatures. The
-    // allocation-free common path in connectivity_coarsens makes this cheap.
-    std::vector<std::vector<uint32_t>> coarser(connectivity_count);
-    if (remaining != 0) {
-        for (const auto& bucket : buckets) {
-            for (uint32_t fine_id : bucket.connectivity_ids) {
-                for (uint32_t coarse_id : bucket.connectivity_ids) {
-                    if (coarse_id == fine_id) continue;
-                    if (connectivity_coarsens(connectivity_pool[coarse_id],
-                                              connectivity_pool[fine_id],
-                                              signature_words)) {
-                        coarser[fine_id].push_back(coarse_id);
-                    }
+    std::vector<size_t> component_counts(connectivity_count, 0);
+    std::vector<std::vector<int>> component_populations(connectivity_count);
+    std::vector<int> minimum_component_population(connectivity_count,
+                                                   std::numeric_limits<int>::max());
+    std::vector<int> maximum_component_population(connectivity_count, 0);
+    for (uint32_t id = 0; id < connectivity_count; ++id) {
+        if (!survivors[id].empty()) {
+            const auto& signature = connectivity_pool[id];
+            component_counts[id] = signature.size() / signature_words;
+            for (size_t offset = 0; offset < signature.size(); offset += signature_words) {
+                int population = 0;
+                for (size_t word = 0; word < signature_words; ++word) {
+                    population += __builtin_popcountll(signature[offset + word]);
                 }
+                minimum_component_population[id] =
+                    std::min(minimum_component_population[id], population);
+                maximum_component_population[id] =
+                    std::max(maximum_component_population[id], population);
+                component_populations[id].push_back(population);
             }
+            std::sort(component_populations[id].begin(), component_populations[id].end());
         }
     }
 
     // Then apply connectivity-coarsening dominance to exact survivors. Keep
     // cross-dominated states available as witnesses until the scan finishes,
-    // matching the previous deferred-erasure behavior.
+    // matching the previous deferred-erasure behavior. Discover coarsening
+    // relationships lazily: many signature pairs cannot have even one
+    // scalar-feasible dominance comparison, and later IDs need no work once
+    // the layer's comparison budget is exhausted.
+    std::vector<uint32_t> coarser;
     bool exhausted = false;
     for (uint32_t fine_id = 0; fine_id < connectivity_count && !exhausted; ++fine_id) {
-        if (coarser[fine_id].empty()) continue;
+        if (survivors[fine_id].empty()) continue;
+        coarser.clear();
+        const auto& candidate_ids =
+            buckets[connectivity_bucket[fine_id]].connectivity_ids;
+        coarser.reserve(candidate_ids.size());
+        for (uint32_t coarse_id : candidate_ids) {
+            if (coarse_id == fine_id || survivors[coarse_id].empty()) continue;
+            if (component_counts[coarse_id] > component_counts[fine_id]) continue;
+            if (maximum_component_population[fine_id] >
+                    maximum_component_population[coarse_id] ||
+                minimum_component_population[fine_id] >
+                    minimum_component_population[coarse_id]) {
+                continue;
+            }
+            bool population_matching_possible = true;
+            for (size_t component = 0; component < component_counts[coarse_id];
+                 ++component) {
+                if (component_populations[fine_id][component] >
+                    component_populations[coarse_id][component]) {
+                    population_matching_possible = false;
+                    break;
+                }
+            }
+            if (!population_matching_possible) continue;
+            if (survivors[coarse_id].front()->key > survivors[fine_id].back()->key) continue;
+            if (minimum_quasi[coarse_id] > maximum_quasi[fine_id]) continue;
+
+            bool relation;
+            if (component_counts[coarse_id] == 1) {
+                // Inside a common-union bucket, its sole component contains
+                // every finer component and is automatically a valid anchor.
+                relation = true;
+            } else {
+                relation = connectivity_coarsens(connectivity_pool[coarse_id],
+                                                  connectivity_pool[fine_id],
+                                                  signature_words);
+            }
+            if (relation) {
+                coarser.push_back(coarse_id);
+            }
+        }
+        if (coarser.empty()) continue;
         for (CachedItem* cached : survivors[fine_id]) {
             bool is_dominated = false;
-            for (uint32_t coarse_id : coarser[fine_id]) {
+            for (uint32_t coarse_id : coarser) {
                 for (CachedItem* prior : survivors[coarse_id]) {
                     if (prior->key > cached->key) break;
                     if (remaining == 0) {
@@ -1272,11 +1343,7 @@ static size_t prune_dominated(Table& table,
                         break;
                     }
                     --remaining;
-                    if (prior->item->second.cost > cached->item->second.cost) continue;
-                    const int penalty = dominance_penalty(
-                        prior->item->first.hits, cached->item->first.hits,
-                        flag_mask, base_mask);
-                    if (prior->item->second.cost + penalty <= cached->item->second.cost) {
+                    if (dominates(prior, cached)) {
                         is_dominated = true;
                         break;
                     }
@@ -1569,7 +1636,7 @@ static Solution solve_frontier(const Model& original_model,
         }
 
         const size_t removed = prune_dominated(
-            next, dominance_comparisons, flag_mask, base_mask,
+            next, dominance_comparisons, base_mask,
             next_connectivity_pool, chosen_words);
         table = std::move(next);
         connectivity_pool.swap(next_connectivity_pool);
