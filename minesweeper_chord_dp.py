@@ -19,6 +19,7 @@ import json
 import random
 import re
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,6 +75,7 @@ class Solution:
     max_boundary_vertices: int = 0
     max_active_factors: int = 0
     order_name: str = ""
+    solve_seconds: float = 0.0
 
 
 def neighbors(cell: Coord, height: int, width: int) -> Iterator[Coord]:
@@ -1116,6 +1118,7 @@ def solution_as_dict(model: Model, solution: Solution, offset: int) -> dict[str,
             "peak_dp_states": solution.peak_states,
             "max_boundary_vertices": solution.max_boundary_vertices,
             "max_active_factors": solution.max_active_factors,
+            "solve_seconds": solution.solve_seconds,
         },
     }
 
@@ -1213,6 +1216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.seed is not None:
                 parser.error("--seed requires --generate")
             height, width, mines = load_board(args.board, args.format)
+        solve_started = time.perf_counter()
         model = build_model(height, width, mines)
         if args.method == "bruteforce":
             solution = solve_bruteforce(model)
@@ -1226,6 +1230,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 progress_every=args.progress_every,
                 dominance_comparisons=args.dominance_comparisons,
             )
+        solution.solve_seconds = time.perf_counter() - solve_started
+        print(
+            f"Solve time: {solution.solve_seconds:.3f} seconds",
+            file=sys.stderr,
+            flush=True,
+        )
         if args.verify and len(model.candidates) <= 25:
             brute = solve_bruteforce(model)
             if brute.clicks != solution.clicks:

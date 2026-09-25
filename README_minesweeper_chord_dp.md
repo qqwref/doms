@@ -100,7 +100,10 @@ If automatic detection is ever inconvenient, use `--format grid`,
 `--format llamasweeper`, or `--format mbf`.
 
 The output gives the optimal count, its breakdown, DP statistics, and a valid
-action sequence. Coordinates are 1-based. Use `--zero-based` to change that.
+action sequence. The total solution time (including preprocessing, exact
+search, reconstruction, and validation) is printed to standard error and is
+also available as `statistics.solve_seconds` in JSON. Coordinates are 1-based.
+Use `--zero-based` to change that.
 
 To print only the executable clicks as `(click_type, x, y)` tuples, use:
 

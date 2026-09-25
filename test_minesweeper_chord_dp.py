@@ -138,6 +138,7 @@ class ChordDpTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue().strip(), "[]")
         self.assertIn("https://llamasweeper.com/#/game/board-editor?b=2&m=", stderr.getvalue())
         self.assertIn("Random seed: 8675309", stderr.getvalue())
+        self.assertRegex(stderr.getvalue(), r"Solve time: \d+\.\d{3} seconds")
         generated_model = solve.call_args.args[0]
         self.assertEqual((generated_model.height, generated_model.width), (16, 16))
         self.assertEqual(len(generated_model.mines), 40)
