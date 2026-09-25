@@ -758,30 +758,31 @@ static size_t hash_combine(size_t seed, uint64_t value) {
     return seed ^ (value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
 }
 
-struct LabelsHash {
-    size_t operator()(const std::vector<uint16_t>& labels) const {
-        size_t hash = labels.size();
-        for (uint16_t label : labels) hash = hash_combine(hash, label);
+struct WordsHash {
+    size_t operator()(const std::vector<uint64_t>& words) const {
+        size_t hash = words.size();
+        for (uint64_t word : words) hash = hash_combine(hash, word);
         return hash;
     }
 };
 
-// Boundary partitions repeat across many factor-hit masks. Intern them once
-// per layer so a state key contains a 32-bit ID instead of an allocated vector.
-class LabelPool {
+// A connectivity state is a sorted multiset of future-reachability bitsets,
+// one per unfinished selected component. Intern it once per layer so each DP
+// state needs only a 32-bit ID.
+class ConnectivityPool {
 public:
-    LabelPool() { intern({}); }
+    ConnectivityPool() { intern({}); }
 
-    uint32_t intern(std::vector<uint16_t> labels) {
-        auto found = ids_.find(labels);
+    uint32_t intern(std::vector<uint64_t> signature) {
+        auto found = ids_.find(signature);
         if (found != ids_.end()) return found->second;
         const uint32_t id = static_cast<uint32_t>(by_id_.size());
-        auto inserted = ids_.emplace(std::move(labels), id).first;
+        auto inserted = ids_.emplace(std::move(signature), id).first;
         by_id_.push_back(&inserted->first);
         return id;
     }
 
-    const std::vector<uint16_t>& operator[](uint32_t id) const { return *by_id_[id]; }
+    const std::vector<uint64_t>& operator[](uint32_t id) const { return *by_id_[id]; }
     size_t size() const { return by_id_.size(); }
     void reserve(size_t count) {
         ids_.reserve(count);
@@ -793,27 +794,27 @@ public:
         reserve(reserve_count);
         intern({});
     }
-    void swap(LabelPool& other) noexcept {
+    void swap(ConnectivityPool& other) noexcept {
         ids_.swap(other.ids_);
         by_id_.swap(other.by_id_);
     }
 
 private:
-    std::unordered_map<std::vector<uint16_t>, uint32_t, LabelsHash> ids_;
-    std::vector<const std::vector<uint16_t>*> by_id_;
+    std::unordered_map<std::vector<uint64_t>, uint32_t, WordsHash> ids_;
+    std::vector<const std::vector<uint64_t>*> by_id_;
 };
 
 struct State {
-    uint32_t label_id = 0;
+    uint32_t connectivity_id = 0;
     Bits hits;
     bool operator==(const State& other) const {
-        return label_id == other.label_id && hits == other.hits;
+        return connectivity_id == other.connectivity_id && hits == other.hits;
     }
 };
 
 struct StateHash {
     size_t operator()(const State& state) const {
-        size_t hash = hash_combine(0, state.label_id);
+        size_t hash = hash_combine(0, state.connectivity_id);
         for (size_t i = 0; i < state.hits.size(); ++i) hash = hash_combine(hash, state.hits[i]);
         return hash;
     }
@@ -826,68 +827,282 @@ struct Record {
 
 using Table = std::unordered_map<State, Record, StateHash>;
 
-static std::vector<uint16_t> canonical_tokens(std::vector<uint16_t> tokens, int largest) {
-    std::vector<uint16_t> renumber(largest + 1, 0);
-    uint16_t next = 1;
-    for (uint16_t& token : tokens) {
-        if (!token) continue;
-        if (!renumber[token]) renumber[token] = next++;
-        token = renumber[token];
-    }
-    return tokens;
-}
-
 struct ConnectivityTransition {
-    uint32_t label_id = 0;
+    uint32_t connectivity_id = 0;
     int closed = 0;
 };
+
+using DominanceKey = std::tuple<int, int, int>;
+
+static DominanceKey dominance_order_key(const Table::value_type& item,
+                                        const Bits& base_mask) {
+    return {item.second.cost + bit_count_and(item.first.hits, base_mask),
+            item.second.cost, -bit_count(item.first.hits)};
+}
+
+// A coarser signature can represent several finer components as one, provided
+// every finer component's future reachability is contained in its representative.
+// Requiring every coarse component to represent at least one fine component
+// prevents an unmatched component from adding a future seed-click liability.
+static bool connectivity_coarsens(const std::vector<uint64_t>& coarse,
+                                  const std::vector<uint64_t>& fine,
+                                  size_t signature_words) {
+    const size_t coarse_count = coarse.size() / signature_words;
+    const size_t fine_count = fine.size() / signature_words;
+    if (coarse_count > fine_count) return false;
+    if (coarse_count == 0) return fine_count == 0;
+
+    // Normal Minesweeper frontiers have far fewer than 64 live components.
+    // Keep the entire eligibility graph and matching state on the stack in
+    // that common case instead of allocating several nested vectors for every
+    // pair of connectivity signatures.
+    constexpr size_t kInlineComponents = 64;
+    if (coarse_count <= kInlineComponents && fine_count <= kInlineComponents) {
+        std::array<uint64_t, kInlineComponents> eligible{};
+        uint64_t represented = 0;
+        for (size_t c = 0; c < coarse_count; ++c) {
+            uint64_t mask = 0;
+            for (size_t f = 0; f < fine_count; ++f) {
+                bool subset = true;
+                for (size_t word = 0; word < signature_words; ++word) {
+                    const uint64_t fine_word = fine[f * signature_words + word];
+                    const uint64_t coarse_word = coarse[c * signature_words + word];
+                    if ((fine_word | coarse_word) != coarse_word) {
+                        subset = false;
+                        break;
+                    }
+                }
+                if (subset) mask |= uint64_t{1} << f;
+            }
+            eligible[c] = mask;
+            represented |= mask;
+        }
+        const uint64_t all_fine = fine_count == 64
+            ? ~uint64_t{0} : ((uint64_t{1} << fine_count) - 1);
+        if (represented != all_fine) return false;
+
+        std::array<int, kInlineComponents> fine_match;
+        fine_match.fill(-1);
+        for (size_t c = 0; c < coarse_count; ++c) {
+            uint64_t seen = 0;
+            auto augment = [&](auto&& self, size_t candidate) -> bool {
+                uint64_t choices = eligible[candidate] & ~seen;
+                while (choices != 0) {
+                    const size_t f = static_cast<size_t>(__builtin_ctzll(choices));
+                    const uint64_t bit = uint64_t{1} << f;
+                    choices &= choices - 1;
+                    seen |= bit;
+                    if (fine_match[f] < 0 ||
+                        self(self, static_cast<size_t>(fine_match[f]))) {
+                        fine_match[f] = static_cast<int>(candidate);
+                        return true;
+                    }
+                }
+                return false;
+            };
+            if (!augment(augment, c)) return false;
+        }
+        return true;
+    }
+
+    // Extremely wide custom boards retain the general dynamically-sized path.
+    std::vector<std::vector<uint8_t>> eligible(
+        coarse_count, std::vector<uint8_t>(fine_count, 0));
+    for (size_t f = 0; f < fine_count; ++f) {
+        bool represented = false;
+        for (size_t c = 0; c < coarse_count; ++c) {
+            bool subset = true;
+            for (size_t word = 0; word < signature_words; ++word) {
+                const uint64_t fine_word = fine[f * signature_words + word];
+                const uint64_t coarse_word = coarse[c * signature_words + word];
+                if ((fine_word | coarse_word) != coarse_word) {
+                    subset = false;
+                    break;
+                }
+            }
+            eligible[c][f] = subset;
+            represented = represented || subset;
+        }
+        if (!represented) return false;
+    }
+
+    // Find distinct fine components to anchor every coarse component. All
+    // remaining fine components may map many-to-one to any eligible anchor.
+    std::vector<int> fine_match(fine_count, -1);
+    for (size_t c = 0; c < coarse_count; ++c) {
+        std::vector<uint8_t> seen(fine_count, 0);
+        auto augment = [&](auto&& self, size_t candidate) -> bool {
+            for (size_t f = 0; f < fine_count; ++f) {
+                if (!eligible[candidate][f] || seen[f]) continue;
+                seen[f] = 1;
+                if (fine_match[f] < 0 || self(self, static_cast<size_t>(fine_match[f]))) {
+                    fine_match[f] = static_cast<int>(candidate);
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (!augment(augment, c)) return false;
+    }
+    return true;
+}
 
 static size_t prune_dominated(Table& table,
                               uint64_t comparison_limit,
                               const Bits& flag_mask,
                               const Bits& base_mask,
-                              size_t label_count) {
+                              const ConnectivityPool& connectivity_pool,
+                              size_t signature_words) {
     if (comparison_limit == 0 || table.size() < 2) return 0;
     using Item = Table::iterator;
-    std::vector<std::vector<Item>> groups(label_count);
+    struct CachedItem {
+        Item item;
+        DominanceKey key;
+        bool exact_dominated = false;
+        bool cross_dominated = false;
+    };
+    struct Bucket {
+        std::vector<uint32_t> connectivity_ids;
+        std::vector<CachedItem> entries;
+    };
+
+    const size_t connectivity_count = connectivity_pool.size();
+    std::vector<size_t> state_counts(connectivity_count, 0);
     for (auto item = table.begin(); item != table.end(); ++item) {
-        groups[item->first.label_id].push_back(item);
+        ++state_counts[item->first.connectivity_id];
     }
-    size_t removed = 0;
-    uint64_t remaining = comparison_limit;
-    for (auto& entries : groups) {
-        if (entries.size() < 2) continue;
-        std::sort(entries.begin(), entries.end(), [&](Item a, Item b) {
-            const auto key_a = std::tuple<int, int, int>{
-                a->second.cost + bit_count_and(a->first.hits, base_mask),
-                a->second.cost, -bit_count(a->first.hits)};
-            const auto key_b = std::tuple<int, int, int>{
-                b->second.cost + bit_count_and(b->first.hits, base_mask),
-                b->second.cost, -bit_count(b->first.hits)};
-            return key_a < key_b;
-        });
-        std::vector<Item> kept;
-        std::vector<Item> dominated;
-        for (Item item : entries) {
-            if (remaining < kept.size()) {
-                break;
+
+    // Group connectivity signatures by total future reachability. Both exact
+    // and coarsening dominance can then reuse one cached key and one sort per
+    // union bucket instead of rebuilding and sorting the table twice.
+    std::unordered_map<std::vector<uint64_t>, size_t, WordsHash> bucket_by_union;
+    bucket_by_union.reserve(connectivity_count);
+    std::vector<Bucket> buckets;
+    std::vector<size_t> connectivity_bucket(connectivity_count,
+                                             std::numeric_limits<size_t>::max());
+    for (uint32_t id = 0; id < connectivity_count; ++id) {
+        if (state_counts[id] == 0) continue;
+        std::vector<uint64_t> combined(signature_words, 0);
+        const auto& signature = connectivity_pool[id];
+        for (size_t offset = 0; offset < signature.size(); offset += signature_words) {
+            for (size_t word = 0; word < signature_words; ++word) {
+                combined[word] |= signature[offset + word];
             }
-            remaining -= kept.size();
+        }
+        auto [where, inserted] = bucket_by_union.emplace(std::move(combined), buckets.size());
+        if (inserted) buckets.emplace_back();
+        const size_t bucket = where->second;
+        connectivity_bucket[id] = bucket;
+        buckets[bucket].connectivity_ids.push_back(id);
+    }
+    std::vector<size_t> bucket_state_counts(buckets.size(), 0);
+    for (uint32_t id = 0; id < connectivity_count; ++id) {
+        if (state_counts[id] != 0) {
+            bucket_state_counts[connectivity_bucket[id]] += state_counts[id];
+        }
+    }
+    for (size_t bucket = 0; bucket < buckets.size(); ++bucket) {
+        buckets[bucket].entries.reserve(bucket_state_counts[bucket]);
+    }
+    for (auto item = table.begin(); item != table.end(); ++item) {
+        const size_t bucket = connectivity_bucket[item->first.connectivity_id];
+        buckets[bucket].entries.push_back(
+            CachedItem{item, dominance_order_key(*item, base_mask), false, false});
+    }
+    for (auto& bucket : buckets) {
+        std::sort(bucket.entries.begin(), bucket.entries.end(),
+                  [](const CachedItem& a, const CachedItem& b) {
+                      return a.key < b.key;
+                  });
+    }
+
+    uint64_t remaining = comparison_limit;
+    std::vector<std::vector<CachedItem*>> survivors(connectivity_count);
+    for (uint32_t id = 0; id < connectivity_count; ++id) {
+        survivors[id].reserve(state_counts[id]);
+    }
+
+    // First remove factor-dominated states with identical connectivity. The
+    // per-ID survivor lists inherit the bucket's cached sort order.
+    for (auto& bucket : buckets) {
+        for (CachedItem& cached : bucket.entries) {
+            auto& kept = survivors[cached.item->first.connectivity_id];
             bool is_dominated = false;
-            for (Item prior : kept) {
-                if (prior->second.cost > item->second.cost) continue;
-                const int penalty = dominance_penalty(
-                    prior->first.hits, item->first.hits, flag_mask, base_mask);
-                if (prior->second.cost + penalty <= item->second.cost) {
-                    is_dominated = true;
-                    break;
+            if (remaining >= kept.size()) {
+                remaining -= kept.size();
+                for (CachedItem* prior : kept) {
+                    if (prior->item->second.cost > cached.item->second.cost) continue;
+                    const int penalty = dominance_penalty(
+                        prior->item->first.hits, cached.item->first.hits,
+                        flag_mask, base_mask);
+                    if (prior->item->second.cost + penalty <= cached.item->second.cost) {
+                        is_dominated = true;
+                        break;
+                    }
                 }
             }
-            if (is_dominated) dominated.push_back(item);
-            else kept.push_back(item);
+            cached.exact_dominated = is_dominated;
+            if (!is_dominated) kept.push_back(&cached);
         }
-        removed += dominated.size();
-        for (Item item : dominated) table.erase(item);
+    }
+
+    // Precompute which signatures can dominate which finer signatures. The
+    // allocation-free common path in connectivity_coarsens makes this cheap.
+    std::vector<std::vector<uint32_t>> coarser(connectivity_count);
+    if (remaining != 0) {
+        for (const auto& bucket : buckets) {
+            for (uint32_t fine_id : bucket.connectivity_ids) {
+                for (uint32_t coarse_id : bucket.connectivity_ids) {
+                    if (coarse_id == fine_id) continue;
+                    if (connectivity_coarsens(connectivity_pool[coarse_id],
+                                              connectivity_pool[fine_id],
+                                              signature_words)) {
+                        coarser[fine_id].push_back(coarse_id);
+                    }
+                }
+            }
+        }
+    }
+
+    // Then apply connectivity-coarsening dominance to exact survivors. Keep
+    // cross-dominated states available as witnesses until the scan finishes,
+    // matching the previous deferred-erasure behavior.
+    bool exhausted = false;
+    for (uint32_t fine_id = 0; fine_id < connectivity_count && !exhausted; ++fine_id) {
+        if (coarser[fine_id].empty()) continue;
+        for (CachedItem* cached : survivors[fine_id]) {
+            bool is_dominated = false;
+            for (uint32_t coarse_id : coarser[fine_id]) {
+                for (CachedItem* prior : survivors[coarse_id]) {
+                    if (prior->key > cached->key) break;
+                    if (remaining == 0) {
+                        exhausted = true;
+                        break;
+                    }
+                    --remaining;
+                    if (prior->item->second.cost > cached->item->second.cost) continue;
+                    const int penalty = dominance_penalty(
+                        prior->item->first.hits, cached->item->first.hits,
+                        flag_mask, base_mask);
+                    if (prior->item->second.cost + penalty <= cached->item->second.cost) {
+                        is_dominated = true;
+                        break;
+                    }
+                }
+                if (is_dominated || exhausted) break;
+            }
+            cached->cross_dominated = is_dominated;
+            if (exhausted) break;
+        }
+    }
+
+    size_t removed = 0;
+    for (auto& bucket : buckets) {
+        for (CachedItem& cached : bucket.entries) {
+            if (!cached.exact_dominated && !cached.cross_dominated) continue;
+            table.erase(cached.item);
+            ++removed;
+        }
     }
     return removed;
 }
@@ -977,6 +1192,17 @@ static Solution solve_frontier(const Model& original_model,
             for (int variable : model.zero_scopes[z]) zero_memberships[variable].push_back(z);
         }
     }
+    std::vector<Bits> future_neighbors(q, Bits(chosen_words));
+    for (int i = 0; i < q; ++i) {
+        for (int other : model.graph[i]) {
+            if (other > i) set_bit(future_neighbors[i], other);
+        }
+        for (int z : zero_memberships[i]) {
+            for (int other : model.zero_scopes[z]) {
+                if (other > i) set_bit(future_neighbors[i], other);
+            }
+        }
+    }
     std::vector<int> last_future(q);
     for (int i = 0; i < q; ++i) {
         last_future[i] = i;
@@ -998,38 +1224,15 @@ static Solution solve_frontier(const Model& original_model,
     table.max_load_factor(0.8f);
     table.reserve(1024);
     table.emplace(State{0, Bits(factor_words)}, Record{model.three_bv(), Bits(chosen_words)});
-    LabelPool label_pool;
-    LabelPool next_label_pool;
+    ConnectivityPool connectivity_pool;
+    ConnectivityPool next_connectivity_pool;
     size_t peak_states = 1;
     int max_boundary = 0;
     int max_active = 0;
     size_t dominated_total = 0;
 
     for (int i = 0; i < q; ++i) {
-        const auto& old_boundary = boundaries[i];
         const auto& new_boundary = boundaries[i + 1];
-        std::vector<int> old_position(q + zero_count, -1);
-        for (int p = 0; p < static_cast<int>(old_boundary.size()); ++p) old_position[old_boundary[p]] = p;
-        std::vector<uint8_t> incident_zero(zero_count, 0);
-        for (int z : zero_memberships[i]) incident_zero[z] = 1;
-        std::vector<int> touch_positions;
-        for (int p = 0; p < static_cast<int>(old_boundary.size()); ++p) {
-            const int item = old_boundary[p];
-            if (item < q) {
-                if (std::binary_search(model.graph[i].begin(), model.graph[i].end(), item)) {
-                    touch_positions.push_back(p);
-                }
-            } else if (incident_zero[item - q]) {
-                touch_positions.push_back(p);
-            }
-        }
-        std::vector<int> source_positions;
-        std::vector<int> activate_positions;
-        for (int p = 0; p < static_cast<int>(new_boundary.size()); ++p) {
-            const int item = new_boundary[p];
-            source_positions.push_back(old_position[item]);
-            if (item == i || (item >= q && incident_zero[item - q])) activate_positions.push_back(p);
-        }
 
         Table next;
         next.max_load_factor(0.8f);
@@ -1038,67 +1241,66 @@ static Solution solve_frontier(const Model& original_model,
         const size_t state_capacity = max_states == std::numeric_limits<size_t>::max()
             ? desired_capacity : std::min(max_states + 1, desired_capacity);
         next.reserve(state_capacity);
-        next_label_pool.reset(label_pool.size() * 2 + 16);
+        next_connectivity_pool.reset(connectivity_pool.size() * 2 + 16);
         {
-            std::vector<std::array<ConnectivityTransition, 2>> connectivity_cache(label_pool.size());
-            std::vector<uint8_t> connectivity_ready(label_pool.size(), 0);
+            std::vector<std::array<ConnectivityTransition, 2>> connectivity_cache(
+                connectivity_pool.size());
+            std::vector<uint8_t> connectivity_ready(connectivity_pool.size(), 0);
             for (const auto& [old_state, old_record] : table) {
-                if (!connectivity_ready[old_state.label_id]) {
-                    const auto& old_labels = label_pool[old_state.label_id];
+                if (!connectivity_ready[old_state.connectivity_id]) {
+                    const auto& old_signature = connectivity_pool[old_state.connectivity_id];
                     std::array<ConnectivityTransition, 2> computed;
-                    const int largest_old = old_labels.empty()
-                        ? 0 : *std::max_element(old_labels.begin(), old_labels.end());
                     for (int selected = 0; selected <= 1; ++selected) {
-                        std::vector<uint8_t> merged(largest_old + 2, 0);
-                        if (selected) {
-                            for (int position : touch_positions) {
-                                const uint16_t label = old_labels[position];
-                                if (label) merged[label] = 1;
-                            }
-                        }
-                        int current_token = 0;
-                        if (selected) {
-                            for (int label = 1; label <= largest_old; ++label) {
-                                if (merged[label]) { current_token = label; break; }
-                            }
-                            if (!current_token) current_token = largest_old + 1;
-                        }
-                        std::vector<uint16_t> outgoing;
-                        outgoing.reserve(new_boundary.size());
-                        for (int source : source_positions) {
-                            outgoing.push_back(source >= 0 ? old_labels[source] : 0);
-                        }
-                        if (selected) {
-                            for (uint16_t& token : outgoing) {
-                                if (token && merged[token]) {
-                                    token = static_cast<uint16_t>(current_token);
-                                }
-                            }
-                            for (int position : activate_positions) {
-                                outgoing[position] = static_cast<uint16_t>(current_token);
-                            }
-                        }
-                        std::vector<uint8_t> represented(largest_old + 2, 0);
-                        for (uint16_t token : outgoing) if (token) represented[token] = 1;
-                        std::vector<uint8_t> all(largest_old + 2, 0);
-                        for (int label = 1; label <= largest_old; ++label) all[label] = 1;
-                        if (selected) {
-                            for (int label = 1; label <= largest_old; ++label) {
-                                if (merged[label]) all[label] = 0;
-                            }
-                            all[current_token] = 1;
-                        }
                         int closed = 0;
-                        for (int label = 1; label < static_cast<int>(all.size()); ++label) {
-                            if (all[label] && !represented[label]) ++closed;
+                        std::vector<std::vector<uint64_t>> outgoing;
+                        outgoing.reserve(old_signature.size() / chosen_words + selected);
+                        std::vector<uint64_t> merged(chosen_words, 0);
+                        if (selected) {
+                            for (size_t word = 0; word < chosen_words; ++word) {
+                                merged[word] = future_neighbors[i][word];
+                            }
                         }
-                        auto canonical = canonical_tokens(
-                            std::move(outgoing), std::max(largest_old, current_token));
-                        computed[selected] = {
-                            next_label_pool.intern(std::move(canonical)), closed};
+                        for (size_t offset = 0; offset < old_signature.size();
+                             offset += chosen_words) {
+                            const bool touches =
+                                (old_signature[offset + i / 64] >> (i % 64)) & 1U;
+                            if (selected && touches) {
+                                for (size_t word = 0; word < chosen_words; ++word) {
+                                    merged[word] |= old_signature[offset + word];
+                                }
+                                continue;
+                            }
+                            std::vector<uint64_t> component(
+                                old_signature.begin() + static_cast<std::ptrdiff_t>(offset),
+                                old_signature.begin() + static_cast<std::ptrdiff_t>(
+                                    offset + chosen_words));
+                            component[i / 64] &= ~(uint64_t{1} << (i % 64));
+                            const bool nonempty = std::any_of(
+                                component.begin(), component.end(),
+                                [](uint64_t word) { return word != 0; });
+                            if (nonempty) outgoing.push_back(std::move(component));
+                            else ++closed;
+                        }
+                        if (selected) {
+                            merged[i / 64] &= ~(uint64_t{1} << (i % 64));
+                            const bool nonempty = std::any_of(
+                                merged.begin(), merged.end(),
+                                [](uint64_t word) { return word != 0; });
+                            if (nonempty) outgoing.push_back(std::move(merged));
+                            else ++closed;
+                        }
+                        std::sort(outgoing.begin(), outgoing.end());
+                        std::vector<uint64_t> canonical;
+                        canonical.reserve(outgoing.size() * chosen_words);
+                        for (auto& component : outgoing) {
+                            canonical.insert(canonical.end(), component.begin(), component.end());
+                        }
+                        computed[selected] = {next_connectivity_pool.intern(
+                                                  std::move(canonical)),
+                                              closed};
                     }
-                    connectivity_cache[old_state.label_id] = std::move(computed);
-                    connectivity_ready[old_state.label_id] = 1;
+                    connectivity_cache[old_state.connectivity_id] = std::move(computed);
+                    connectivity_ready[old_state.connectivity_id] = 1;
                 }
 
                 for (int selected = 0; selected <= 1; ++selected) {
@@ -1114,22 +1316,25 @@ static Solution solve_frontier(const Model& original_model,
                     for (size_t word = 0; word < factor_words; ++word) {
                         new_hits[word] &= active_after[i][word];
                     }
-                    const auto& connection = connectivity_cache[old_state.label_id][selected];
+                    const auto& connection =
+                        connectivity_cache[old_state.connectivity_id][selected];
                     const int new_cost = old_record.cost + selected + connection.closed + factor_cost;
-                    Bits new_chosen = old_record.chosen;
-                    if (selected) set_bit(new_chosen, i);
-                    State state{connection.label_id, std::move(new_hits)};
+                    State state{connection.connectivity_id, std::move(new_hits)};
                     auto found = next.find(state);
                     if (found == next.end()) {
+                        Bits new_chosen = old_record.chosen;
+                        if (selected) set_bit(new_chosen, i);
                         next.emplace(std::move(state), Record{new_cost, std::move(new_chosen)});
                     } else if (new_cost < found->second.cost) {
-                        found->second = Record{new_cost, std::move(new_chosen)};
+                        found->second.cost = new_cost;
+                        found->second.chosen = old_record.chosen;
+                        if (selected) set_bit(found->second.chosen, i);
                     }
                 }
             }
         }
 
-        // The previous layer and its label pool are no longer needed. Release
+        // The previous layer and connectivity pool are no longer needed. Release
         // them before dominance pruning so they do not overlap the largest
         // temporary structures of the new layer.
         {
@@ -1137,14 +1342,15 @@ static Solution solve_frontier(const Model& original_model,
             table.swap(released);
         }
         {
-            LabelPool released;
-            label_pool.swap(released);
+            ConnectivityPool released;
+            connectivity_pool.swap(released);
         }
 
         const size_t removed = prune_dominated(
-            next, dominance_comparisons, flag_mask, base_mask, next_label_pool.size());
+            next, dominance_comparisons, flag_mask, base_mask,
+            next_connectivity_pool, chosen_words);
         table = std::move(next);
-        label_pool.swap(next_label_pool);
+        connectivity_pool.swap(next_connectivity_pool);
         dominated_total += removed;
         peak_states = std::max(peak_states, table.size());
         max_boundary = std::max(max_boundary, static_cast<int>(new_boundary.size()));
