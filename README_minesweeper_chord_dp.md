@@ -66,6 +66,12 @@ test board below, those representation changes reduced the solve time from
 https://llamasweeper.com/#/game/board-editor?b=2&m=000g14s0010421g080414h4540a0g8880kg200800080o5400c00
 ```
 
+A subsequent generalized factor-dominance pass reduced this board from
+1,301,047 to 558,071 retained states. In a paired run it reduced solve time
+from 53.57 to 26.90 seconds and peak resident memory from about 755 MiB to
+343 MiB. The exact click count remained 52, although the solver found a
+different equally optimal chord set.
+
 The earlier supplied LlamaSweeper example took about 0.7 seconds in C++ versus
 about 2.2 seconds in Python in the same run. Exact timings depend strongly on
 the board, compiler, and machine.
@@ -255,13 +261,18 @@ shared by all states having the same boundary partition, and each distinct
 partition is interned once per layer; hash-table state keys carry only its
 integer ID.
 
-The DP also performs exact Pareto pruning. For equal connectivity, a state can
-be discarded when another state has a superset of future-useful hits at a
-provably sufficient cost advantage. In particular, flags that have already
-been paid for are useful resources for later chords. Covered 3BV units require
-an additional potential-cost check because their saving has already been
-credited. `--dominance-comparisons 0` disables this pruning; the default caps
-its work per layer so pruning itself cannot grow without bound.
+The DP also performs exact Pareto pruning. For equal connectivity, it compares
+two factor-hit masks using their worst possible future cost difference. A state
+may therefore dominate another even when neither hit mask contains the other:
+its existing cost advantage need only cover every flag it might still have to
+pay for and every 3BV saving the other state might still earn. This strictly
+generalizes ordinary superset dominance. `--dominance-comparisons 0` disables
+this pruning; the default caps its work per layer so pruning itself cannot grow
+without bound.
+
+Dominance pruning erases states in place. The previous DP layer and its cached
+connectivity data are released before pruning starts, avoiding simultaneous
+storage of the previous, unpruned-next, and copied-pruned hash tables.
 
 The implementation estimates both row and column layouts. It also tests wider
 bands when the width estimate shows a clear improvement; `--band-size N`

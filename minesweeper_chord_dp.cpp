@@ -736,11 +736,17 @@ static int bit_count_new_and(const Bits& member, const Bits& old, const Bits& fi
     return count;
 }
 
-static bool is_superset(const Bits& candidate, const Bits& other) {
+// Worst extra cost candidate can incur relative to other under the same future
+// chord choices: an unpaid flag, or a 3BV saving that other can still earn.
+static int dominance_penalty(const Bits& candidate, const Bits& other,
+                             const Bits& flag_mask, const Bits& base_mask) {
+    int penalty = 0;
     for (size_t i = 0; i < candidate.size(); ++i) {
-        if ((candidate[i] | other[i]) != candidate[i]) return false;
+        const uint64_t candidate_lacks_flag = ~candidate[i] & other[i] & flag_mask[i];
+        const uint64_t other_can_gain_base = candidate[i] & ~other[i] & base_mask[i];
+        penalty += __builtin_popcountll(candidate_lacks_flag | other_can_gain_base);
     }
-    return true;
+    return penalty;
 }
 
 static size_t hash_combine(size_t seed, uint64_t value) {
@@ -836,25 +842,21 @@ struct ConnectivityTransition {
     int closed = 0;
 };
 
-static std::pair<Table, size_t> prune_dominated(Table&& table,
-                                                 uint64_t comparison_limit,
-                                                 const Bits& base_mask,
-                                                 size_t label_count) {
-    if (comparison_limit == 0 || table.size() < 2) return {std::move(table), 0};
-    using Item = const Table::value_type*;
+static size_t prune_dominated(Table& table,
+                              uint64_t comparison_limit,
+                              const Bits& flag_mask,
+                              const Bits& base_mask,
+                              size_t label_count) {
+    if (comparison_limit == 0 || table.size() < 2) return 0;
+    using Item = Table::iterator;
     std::vector<std::vector<Item>> groups(label_count);
-    for (const auto& entry : table) groups[entry.first.label_id].push_back(&entry);
-    Table result;
-    result.max_load_factor(0.8f);
-    result.reserve(table.size());
+    for (auto item = table.begin(); item != table.end(); ++item) {
+        groups[item->first.label_id].push_back(item);
+    }
     size_t removed = 0;
     uint64_t remaining = comparison_limit;
     for (auto& entries : groups) {
-        if (entries.empty()) continue;
-        if (entries.size() == 1) {
-            result.emplace(entries[0]->first, entries[0]->second);
-            continue;
-        }
+        if (entries.size() < 2) continue;
         std::sort(entries.begin(), entries.end(), [&](Item a, Item b) {
             const auto key_a = std::tuple<int, int, int>{
                 a->second.cost + bit_count_and(a->first.hits, base_mask),
@@ -865,31 +867,29 @@ static std::pair<Table, size_t> prune_dominated(Table&& table,
             return key_a < key_b;
         });
         std::vector<Item> kept;
-        bool complete = true;
+        std::vector<Item> dominated;
         for (Item item : entries) {
             if (remaining < kept.size()) {
-                complete = false;
                 break;
             }
             remaining -= kept.size();
-            bool dominated = false;
+            bool is_dominated = false;
             for (Item prior : kept) {
-                if (prior->second.cost <= item->second.cost &&
-                    is_superset(prior->first.hits, item->first.hits)) {
-                    dominated = true;
+                if (prior->second.cost > item->second.cost) continue;
+                const int penalty = dominance_penalty(
+                    prior->first.hits, item->first.hits, flag_mask, base_mask);
+                if (prior->second.cost + penalty <= item->second.cost) {
+                    is_dominated = true;
                     break;
                 }
             }
-            if (dominated) ++removed;
+            if (is_dominated) dominated.push_back(item);
             else kept.push_back(item);
         }
-        if (complete) {
-            for (Item item : kept) result.emplace(item->first, item->second);
-        } else {
-            for (Item item : entries) result.emplace(item->first, item->second);
-        }
+        removed += dominated.size();
+        for (Item item : dominated) table.erase(item);
     }
-    return {std::move(result), removed};
+    return removed;
 }
 
 static std::vector<int> ordered_region_ranks(const Model& model, const std::string& order_name) {
@@ -1039,93 +1039,111 @@ static Solution solve_frontier(const Model& original_model,
             ? desired_capacity : std::min(max_states + 1, desired_capacity);
         next.reserve(state_capacity);
         next_label_pool.reset(label_pool.size() * 2 + 16);
-        std::vector<std::array<ConnectivityTransition, 2>> connectivity_cache(label_pool.size());
-        std::vector<uint8_t> connectivity_ready(label_pool.size(), 0);
-        for (const auto& [old_state, old_record] : table) {
-            if (!connectivity_ready[old_state.label_id]) {
-                const auto& old_labels = label_pool[old_state.label_id];
-                std::array<ConnectivityTransition, 2> computed;
-                const int largest_old = old_labels.empty()
-                    ? 0 : *std::max_element(old_labels.begin(), old_labels.end());
-                for (int selected = 0; selected <= 1; ++selected) {
-                    std::vector<uint8_t> merged(largest_old + 2, 0);
-                    if (selected) {
-                        for (int position : touch_positions) {
-                            const uint16_t label = old_labels[position];
-                            if (label) merged[label] = 1;
+        {
+            std::vector<std::array<ConnectivityTransition, 2>> connectivity_cache(label_pool.size());
+            std::vector<uint8_t> connectivity_ready(label_pool.size(), 0);
+            for (const auto& [old_state, old_record] : table) {
+                if (!connectivity_ready[old_state.label_id]) {
+                    const auto& old_labels = label_pool[old_state.label_id];
+                    std::array<ConnectivityTransition, 2> computed;
+                    const int largest_old = old_labels.empty()
+                        ? 0 : *std::max_element(old_labels.begin(), old_labels.end());
+                    for (int selected = 0; selected <= 1; ++selected) {
+                        std::vector<uint8_t> merged(largest_old + 2, 0);
+                        if (selected) {
+                            for (int position : touch_positions) {
+                                const uint16_t label = old_labels[position];
+                                if (label) merged[label] = 1;
+                            }
                         }
-                    }
-                    int current_token = 0;
-                    if (selected) {
-                        for (int label = 1; label <= largest_old; ++label) {
-                            if (merged[label]) { current_token = label; break; }
+                        int current_token = 0;
+                        if (selected) {
+                            for (int label = 1; label <= largest_old; ++label) {
+                                if (merged[label]) { current_token = label; break; }
+                            }
+                            if (!current_token) current_token = largest_old + 1;
                         }
-                        if (!current_token) current_token = largest_old + 1;
-                    }
-                    std::vector<uint16_t> outgoing;
-                    outgoing.reserve(new_boundary.size());
-                    for (int source : source_positions) {
-                        outgoing.push_back(source >= 0 ? old_labels[source] : 0);
-                    }
-                    if (selected) {
-                        for (uint16_t& token : outgoing) {
-                            if (token && merged[token]) token = static_cast<uint16_t>(current_token);
+                        std::vector<uint16_t> outgoing;
+                        outgoing.reserve(new_boundary.size());
+                        for (int source : source_positions) {
+                            outgoing.push_back(source >= 0 ? old_labels[source] : 0);
                         }
-                        for (int position : activate_positions) {
-                            outgoing[position] = static_cast<uint16_t>(current_token);
+                        if (selected) {
+                            for (uint16_t& token : outgoing) {
+                                if (token && merged[token]) {
+                                    token = static_cast<uint16_t>(current_token);
+                                }
+                            }
+                            for (int position : activate_positions) {
+                                outgoing[position] = static_cast<uint16_t>(current_token);
+                            }
                         }
-                    }
-                    std::vector<uint8_t> represented(largest_old + 2, 0);
-                    for (uint16_t token : outgoing) if (token) represented[token] = 1;
-                    std::vector<uint8_t> all(largest_old + 2, 0);
-                    for (int label = 1; label <= largest_old; ++label) all[label] = 1;
-                    if (selected) {
-                        for (int label = 1; label <= largest_old; ++label) {
-                            if (merged[label]) all[label] = 0;
+                        std::vector<uint8_t> represented(largest_old + 2, 0);
+                        for (uint16_t token : outgoing) if (token) represented[token] = 1;
+                        std::vector<uint8_t> all(largest_old + 2, 0);
+                        for (int label = 1; label <= largest_old; ++label) all[label] = 1;
+                        if (selected) {
+                            for (int label = 1; label <= largest_old; ++label) {
+                                if (merged[label]) all[label] = 0;
+                            }
+                            all[current_token] = 1;
                         }
-                        all[current_token] = 1;
+                        int closed = 0;
+                        for (int label = 1; label < static_cast<int>(all.size()); ++label) {
+                            if (all[label] && !represented[label]) ++closed;
+                        }
+                        auto canonical = canonical_tokens(
+                            std::move(outgoing), std::max(largest_old, current_token));
+                        computed[selected] = {
+                            next_label_pool.intern(std::move(canonical)), closed};
                     }
-                    int closed = 0;
-                    for (int label = 1; label < static_cast<int>(all.size()); ++label) {
-                        if (all[label] && !represented[label]) ++closed;
-                    }
-                    auto canonical = canonical_tokens(
-                        std::move(outgoing), std::max(largest_old, current_token));
-                    computed[selected] = {next_label_pool.intern(std::move(canonical)), closed};
+                    connectivity_cache[old_state.label_id] = std::move(computed);
+                    connectivity_ready[old_state.label_id] = 1;
                 }
-                connectivity_cache[old_state.label_id] = std::move(computed);
-                connectivity_ready[old_state.label_id] = 1;
-            }
 
-            for (int selected = 0; selected <= 1; ++selected) {
-                Bits new_hits = old_state.hits;
-                int factor_cost = 0;
-                if (selected) {
-                    factor_cost += bit_count_new_and(factor_member[i], old_state.hits, flag_mask);
-                    factor_cost -= bit_count_new_and(factor_member[i], old_state.hits, base_mask);
-                    for (size_t word = 0; word < factor_words; ++word) {
-                        new_hits[word] |= factor_member[i][word];
+                for (int selected = 0; selected <= 1; ++selected) {
+                    Bits new_hits = old_state.hits;
+                    int factor_cost = 0;
+                    if (selected) {
+                        factor_cost += bit_count_new_and(factor_member[i], old_state.hits, flag_mask);
+                        factor_cost -= bit_count_new_and(factor_member[i], old_state.hits, base_mask);
+                        for (size_t word = 0; word < factor_words; ++word) {
+                            new_hits[word] |= factor_member[i][word];
+                        }
                     }
-                }
-                for (size_t word = 0; word < factor_words; ++word) {
-                    new_hits[word] &= active_after[i][word];
-                }
-                const auto& connection = connectivity_cache[old_state.label_id][selected];
-                const int new_cost = old_record.cost + selected + connection.closed + factor_cost;
-                Bits new_chosen = old_record.chosen;
-                if (selected) set_bit(new_chosen, i);
-                State state{connection.label_id, std::move(new_hits)};
-                auto found = next.find(state);
-                if (found == next.end()) {
-                    next.emplace(std::move(state), Record{new_cost, std::move(new_chosen)});
-                } else if (new_cost < found->second.cost) {
-                    found->second = Record{new_cost, std::move(new_chosen)};
+                    for (size_t word = 0; word < factor_words; ++word) {
+                        new_hits[word] &= active_after[i][word];
+                    }
+                    const auto& connection = connectivity_cache[old_state.label_id][selected];
+                    const int new_cost = old_record.cost + selected + connection.closed + factor_cost;
+                    Bits new_chosen = old_record.chosen;
+                    if (selected) set_bit(new_chosen, i);
+                    State state{connection.label_id, std::move(new_hits)};
+                    auto found = next.find(state);
+                    if (found == next.end()) {
+                        next.emplace(std::move(state), Record{new_cost, std::move(new_chosen)});
+                    } else if (new_cost < found->second.cost) {
+                        found->second = Record{new_cost, std::move(new_chosen)};
+                    }
                 }
             }
         }
-        auto [pruned, removed] = prune_dominated(
-            std::move(next), dominance_comparisons, base_mask, next_label_pool.size());
-        table = std::move(pruned);
+
+        // The previous layer and its label pool are no longer needed. Release
+        // them before dominance pruning so they do not overlap the largest
+        // temporary structures of the new layer.
+        {
+            Table released;
+            table.swap(released);
+        }
+        {
+            LabelPool released;
+            label_pool.swap(released);
+        }
+
+        const size_t removed = prune_dominated(
+            next, dominance_comparisons, flag_mask, base_mask, next_label_pool.size());
+        table = std::move(next);
         label_pool.swap(next_label_pool);
         dominated_total += removed;
         peak_states = std::max(peak_states, table.size());
