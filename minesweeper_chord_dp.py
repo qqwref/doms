@@ -17,6 +17,7 @@ import argparse
 import itertools
 import json
 import re
+import sys
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,19 +39,6 @@ class StateLimitExceeded(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
-class Factor:
-    """An OR factor over selected chord variables.
-
-    kind == "flag": contributes 1 iff at least one variable is selected.
-    kind == "base": contributes 1 iff no variable is selected.
-    """
-
-    kind: str
-    scope: tuple[int, ...]
-    item: int
-
-
 @dataclass
 class Model:
     height: int
@@ -60,7 +48,10 @@ class Model:
     zeros: list[set[Coord]]
     singleton_units: list[Coord]
     candidates: list[Coord]
+    # Direct chord-to-chord opening adjacency. Zero-region propagation is
+    # represented separately as a hyperedge in zero_scopes.
     graph: list[set[int]]
+    zero_scopes: list[tuple[int, ...]]
     mine_scopes: list[tuple[int, ...]]
     base_scopes: list[tuple[int, ...]]
     base_descriptions: list[tuple[str, object]]
@@ -352,8 +343,8 @@ def build_model(height: int, width: int, mines: set[Coord]) -> Model:
                 graph[i].add(j)
                 graph[j].add(i)
 
-    # Flood opening: a chord on the boundary of a zero component reveals the
-    # component, whose flood-fill reveals every other boundary chord square.
+    # Flood opening is a hyperedge rather than an explicit clique. An explicit
+    # clique can turn one large opening into a huge DP frontier.
     zero_boundaries: list[tuple[int, ...]] = []
     for component in zeros:
         boundary = sorted(
@@ -365,10 +356,6 @@ def build_model(height: int, width: int, mines: set[Coord]) -> Model:
             }
         )
         zero_boundaries.append(tuple(boundary))
-        for pos, i in enumerate(boundary):
-            for j in boundary[pos + 1 :]:
-                graph[i].add(j)
-                graph[j].add(i)
 
     mine_list = sorted(mines)
     mine_scopes = [
@@ -408,6 +395,7 @@ def build_model(height: int, width: int, mines: set[Coord]) -> Model:
         singleton_units=singleton_units,
         candidates=candidates,
         graph=graph,
+        zero_scopes=zero_boundaries,
         mine_scopes=mine_scopes,
         base_scopes=base_scopes,
         base_descriptions=base_descriptions,
@@ -435,17 +423,34 @@ def _ordered_model(model: Model, order: Sequence[int]) -> Model:
         singleton_units=model.singleton_units,
         candidates=candidates,
         graph=graph,
+        zero_scopes=remap(model.zero_scopes),
         mine_scopes=remap(model.mine_scopes),
         base_scopes=remap(model.base_scopes),
         base_descriptions=model.base_descriptions,
     )
 
 
-def _order_indices(model: Model, name: str) -> list[int]:
+def _order_indices(model: Model, name: str, band_size: int = 1) -> list[int]:
+    """Order candidates through horizontal or vertical spatial bands.
+
+    A band of one is ordinary row/column order. Larger bands interpolate
+    between those two extremes and can substantially reduce a particular
+    board's frontier.
+    """
+    if band_size < 1:
+        raise ValueError("band size must be positive")
     if name == "rows":
-        key = lambda i: (model.candidates[i][0], model.candidates[i][1])
+        key = lambda i: (
+            model.candidates[i][0] // band_size,
+            model.candidates[i][1],
+            model.candidates[i][0] % band_size,
+        )
     elif name == "columns":
-        key = lambda i: (model.candidates[i][1], model.candidates[i][0])
+        key = lambda i: (
+            model.candidates[i][1] // band_size,
+            model.candidates[i][0],
+            model.candidates[i][1] % band_size,
+        )
     else:
         raise ValueError(f"unknown order {name!r}")
     return sorted(range(len(model.candidates)), key=key)
@@ -460,6 +465,12 @@ def _width_estimate(model: Model, order: Sequence[int]) -> tuple[int, int, int]:
         future = [inverse[x] for x in model.graph[old] if inverse[x] > i]
         if future:
             graph_intervals.append((i, max(future) - 1))
+    for scope in model.zero_scopes:
+        if scope:
+            positions = [inverse[x] for x in scope]
+            if min(positions) < max(positions):
+                # One connector replaces the clique induced by this opening.
+                graph_intervals.append((min(positions), max(positions) - 1))
     factor_intervals: list[tuple[int, int]] = []
     for scope in itertools.chain(model.mine_scopes, model.base_scopes):
         if scope:
@@ -476,63 +487,213 @@ def _width_estimate(model: Model, order: Sequence[int]) -> tuple[int, int, int]:
     return max_total, max_graph, max_factors
 
 
-def choose_order(model: Model, requested: str) -> tuple[Model, str]:
+def _candidate_band_sizes(size: int) -> list[int]:
+    values = {1, size}
+    value = 2
+    while value < size:
+        values.add(value)
+        value *= 2
+    return sorted(values)
+
+
+def choose_order(
+    model: Model, requested: str, band_size: int | None = None
+) -> tuple[Model, str]:
     if requested != "auto":
-        order = _order_indices(model, requested)
-        return _ordered_model(model, order), requested
+        size = band_size or 1
+        order = _order_indices(model, requested, size)
+        name = requested if size == 1 else f"{requested}-band-{size}"
+        return _ordered_model(model, order), name
     choices = []
-    for name in ("columns", "rows"):
-        order = _order_indices(model, name)
-        choices.append((_width_estimate(model, order), name, order))
+    if band_size is not None:
+        candidates = ((name, band_size) for name in ("columns", "rows"))
+    else:
+        standard = []
+        for name in ("columns", "rows"):
+            order = _order_indices(model, name, 1)
+            standard.append((_width_estimate(model, order), name, order))
+        standard_best = min(standard)[0][0]
+        choices.extend(standard)
+        # Admit a wider band automatically only for a clear width reduction.
+        # Ties often lose because the width estimate cannot predict how many
+        # connectivity partitions each boundary generates.
+        candidates = itertools.chain(
+            (("rows", size) for size in _candidate_band_sizes(model.height)[1:]),
+            (("columns", size) for size in _candidate_band_sizes(model.width)[1:]),
+        )
+    for name, size in candidates:
+        order = _order_indices(model, name, size)
+        display = name if size == 1 else f"{name}-band-{size}"
+        estimate = _width_estimate(model, order)
+        if band_size is not None or estimate[0] <= standard_best - 2:
+            choices.append((estimate, display, order))
     _, name, order = min(choices)
     return _ordered_model(model, order), name
 
 
-def _canonical_labels(roots: list[int | None]) -> tuple[int, ...]:
-    labels: dict[int, int] = {}
-    result = []
-    for root in roots:
-        if root is None:
-            result.append(0)
+def _canonical_tokens(tokens: list[int], largest: int) -> tuple[int, ...]:
+    """Canonicalize component tokens without allocating a dictionary."""
+    renumber = [0] * (largest + 1)
+    next_label = 1
+    for position, token in enumerate(tokens):
+        if token:
+            label = renumber[token]
+            if not label:
+                label = next_label
+                next_label += 1
+                renumber[token] = label
+            tokens[position] = label
+    return tuple(tokens)
+
+
+def _prune_dominated(
+    table: dict[tuple[tuple[int, ...], int], tuple[int, int]],
+    comparison_limit: int,
+    base_factor_mask: int,
+    active_factor_mask: int,
+) -> tuple[dict[tuple[tuple[int, ...], int], tuple[int, int]], int]:
+    """Prune a state when a no-costlier hit-mask superset has equal labels."""
+    if comparison_limit <= 0 or len(table) < 2:
+        return table, 0
+    groups: dict[tuple[int, ...], list[tuple[int, int, int]]] = {}
+    for (labels, hits), (cost, chosen) in table.items():
+        groups.setdefault(labels, []).append((cost, hits, chosen))
+    result: dict[tuple[tuple[int, ...], int], tuple[int, int]] = {}
+    removed = 0
+    comparisons_left = comparison_limit
+    for labels, entries in groups.items():
+        if len(entries) == 1:
+            cost, hits, chosen = entries[0]
+            result[(labels, hits)] = (cost, chosen)
+            continue
+        entries.sort(
+            key=lambda item: (
+                item[0] + (item[1] & base_factor_mask).bit_count(),
+                item[0],
+                -item[1].bit_count(),
+            )
+        )
+        kept: list[tuple[int, int, int]] = []
+        kept_cost: dict[int, int] = {}
+        complete = True
+        for cost, hits, chosen in entries:
+            free_mask = active_factor_mask & ~hits
+            supersets = 1 << free_mask.bit_count()
+            work = min(len(kept), supersets)
+            if comparisons_left < work:
+                complete = False
+                break
+            comparisons_left -= work
+            dominated = False
+            if supersets < len(kept):
+                extra = free_mask
+                while True:
+                    prior_cost = kept_cost.get(hits | extra)
+                    if prior_cost is not None and prior_cost <= cost:
+                        dominated = True
+                        break
+                    if extra == 0:
+                        break
+                    extra = (extra - 1) & free_mask
+            else:
+                for k_cost, k_hits, _ in kept:
+                    if k_cost <= cost and (k_hits | hits) == k_hits:
+                        dominated = True
+                        break
+            if dominated:
+                removed += 1
+            else:
+                kept.append((cost, hits, chosen))
+                kept_cost[hits] = cost
+        if not complete:
+            for cost, hits, chosen in entries:
+                result[(labels, hits)] = (cost, chosen)
         else:
-            if root not in labels:
-                labels[root] = len(labels) + 1
-            result.append(labels[root])
-    return tuple(result)
+            for cost, hits, chosen in kept:
+                result[(labels, hits)] = (cost, chosen)
+    return result, removed
+
+
+def _ordered_region_ranks(model: Model, order_name: str) -> list[int]:
+    """Number of board tiles in the spatial sweep through each candidate."""
+    direction = "rows" if order_name.startswith("rows") else "columns"
+    match = re.search(r"-band-(\d+)$", order_name)
+    band = int(match.group(1)) if match else 1
+
+    def key(cell: Coord) -> tuple[int, int, int]:
+        r, c = cell
+        if direction == "rows":
+            return r // band, c, r % band
+        return c // band, r, c % band
+
+    cells = sorted(
+        ((r, c) for r in range(model.height) for c in range(model.width)), key=key
+    )
+    rank = {cell: i + 1 for i, cell in enumerate(cells)}
+    return [rank[cell] for cell in model.candidates]
 
 
 def solve_frontier(
     original_model: Model,
     order: str = "auto",
     max_states: int = 2_000_000,
+    band_size: int | None = None,
+    progress: bool = False,
+    progress_every: int = 10,
+    progress_stream: object | None = None,
+    dominance_comparisons: int = 1_000_000,
 ) -> Solution:
-    model, order_name = choose_order(original_model, order)
+    model, order_name = choose_order(original_model, order, band_size)
     n = len(model.candidates)
-    factors = [
-        *(Factor("flag", scope, i) for i, scope in enumerate(model.mine_scopes)),
-        *(Factor("base", scope, i) for i, scope in enumerate(model.base_scopes)),
-    ]
-    constant_cost = sum(f.kind == "base" for f in factors if not f.scope)
-    factors = [f for f in factors if f.scope]
 
-    factor_min = [min(f.scope) for f in factors]
-    factor_max = [max(f.scope) for f in factors]
-    factor_members_at: list[list[int]] = [[] for _ in range(n)]
-    for f_id, factor in enumerate(factors):
-        for variable in factor.scope:
-            factor_members_at[variable].append(f_id)
+    # Charge the 3BV baseline up front. Selecting a chord then pays for each
+    # newly required mine flag and credits each newly covered 3BV unit. Factor
+    # state is one integer bitset, avoiding per-transition objects.
+    scopes: list[tuple[int, ...]] = []
+    flag_factor_mask = 0
+    base_factor_mask = 0
+    for is_flag, source in (
+        (True, model.mine_scopes),
+        (False, model.base_scopes),
+    ):
+        for scope in source:
+            if not scope:
+                continue
+            factor_id = len(scopes)
+            scopes.append(scope)
+            if is_flag:
+                flag_factor_mask |= 1 << factor_id
+            else:
+                base_factor_mask |= 1 << factor_id
+    factor_member_mask = [0] * n
+    factor_min = [0] * len(scopes)
+    factor_max = [0] * len(scopes)
+    for factor_id, scope in enumerate(scopes):
+        factor_min[factor_id] = scope[0]
+        factor_max[factor_id] = scope[-1]
+        bit = 1 << factor_id
+        for variable in scope:
+            factor_member_mask[variable] |= bit
+    active_after_masks: list[int] = []
+    for i in range(n):
+        mask = 0
+        for factor_id in range(len(scopes)):
+            if factor_min[factor_id] <= i < factor_max[factor_id]:
+                mask |= 1 << factor_id
+        active_after_masks.append(mask)
 
-    active_factors: list[tuple[int, ...]] = []
-    active_factor_pos: list[dict[int, int]] = []
-    for i in range(-1, n):
-        current = tuple(
-            f_id
-            for f_id in range(len(factors))
-            if factor_min[f_id] <= i < factor_max[f_id]
-        )
-        active_factors.append(current)
-        active_factor_pos.append({f_id: p for p, f_id in enumerate(current)})
-    # Index i+1 corresponds to the state after processing variable i.
+    # Direct adjacency and zero-opening hyperedge membership are precomputed.
+    adjacency_masks = [sum(1 << other for other in edges) for edges in model.graph]
+    zero_membership_masks = [0] * n
+    zero_limits: list[tuple[int, int]] = []
+    for zero_id, scope in enumerate(model.zero_scopes):
+        if scope:
+            zero_limits.append((scope[0], scope[-1]))
+            bit = 1 << zero_id
+            for variable in scope:
+                zero_membership_masks[variable] |= bit
+        else:
+            zero_limits.append((0, -1))
 
     last_future_neighbor = [
         max((other for other in model.graph[i] if other > i), default=i)
@@ -541,96 +702,120 @@ def solve_frontier(
     boundaries: list[tuple[int, ...]] = [tuple()]
     boundary_pos: list[dict[int, int]] = [{}]
     for i in range(n):
-        boundary = tuple(v for v in range(i + 1) if last_future_neighbor[v] > i)
+        boundary = [v for v in range(i + 1) if last_future_neighbor[v] > i]
+        boundary.extend(
+            n + zero_id
+            for zero_id, (first, last) in enumerate(zero_limits)
+            if first <= i < last
+        )
+        boundary = tuple(boundary)
         boundaries.append(boundary)
         boundary_pos.append({v: p for p, v in enumerate(boundary)})
 
+    if progress_every < 1:
+        raise ValueError("progress interval must be positive")
+    region_ranks = _ordered_region_ranks(model, order_name) if progress else []
+    output = progress_stream if progress_stream is not None else sys.stderr
+
     # state -> (cost, complete selected-variable bit mask)
     table: dict[tuple[tuple[int, ...], int], tuple[int, int]] = {
-        (tuple(), 0): (constant_cost, 0)
+        (tuple(), 0): (len(model.base_scopes), 0)
     }
     peak_states = 1
     max_boundary_vertices = 0
     max_active_count = 0
+    dominated_total = 0
 
     for i in range(n):
         old_boundary = boundaries[i]
         new_boundary = boundaries[i + 1]
         old_position = boundary_pos[i]
-        incoming_factors = active_factors[i]  # after i-1
-        outgoing_factors = active_factors[i + 1]  # after i
-        incoming_factor_pos = active_factor_pos[i]
-        member_factors = factor_members_at[i]
+        active_after = active_after_masks[i]
+        member_mask = factor_member_mask[i]
+        zero_mask = zero_membership_masks[i]
+        adjacent = adjacency_masks[i]
+        touch_positions: list[int] = []
+        for position, item in enumerate(old_boundary):
+            if item < n:
+                if adjacent & (1 << item):
+                    touch_positions.append(position)
+            elif zero_mask & (1 << (item - n)):
+                touch_positions.append(position)
+        source_positions = tuple(old_position.get(item, -1) for item in new_boundary)
+        activate_positions = tuple(
+            position
+            for position, item in enumerate(new_boundary)
+            if item == i
+            or (item >= n and zero_mask & (1 << (item - n)))
+        )
         next_table: dict[tuple[tuple[int, ...], int], tuple[int, int]] = {}
+        connectivity_cache: dict[
+            tuple[int, ...],
+            tuple[tuple[tuple[int, ...], int], tuple[tuple[int, ...], int]],
+        ] = {}
 
         for (old_labels, old_hits), (old_cost, chosen_mask) in table.items():
-            for selected in (False, True):
-                # Tiny DSU over selected old-boundary vertices plus i.
-                nodes = [v for p, v in enumerate(old_boundary) if old_labels[p] != 0]
-                if selected:
-                    nodes.append(i)
-                parent = {v: v for v in nodes}
-
-                def find(v: int) -> int:
-                    while parent[v] != v:
-                        parent[v] = parent[parent[v]]
-                        v = parent[v]
-                    return v
-
-                def union(a: int, b: int) -> None:
-                    ra, rb = find(a), find(b)
-                    if ra != rb:
-                        parent[rb] = ra
-
-                first_for_label: dict[int, int] = {}
-                for p, v in enumerate(old_boundary):
-                    label = old_labels[p]
-                    if not label:
-                        continue
-                    if label in first_for_label:
-                        union(v, first_for_label[label])
+            transitions = connectivity_cache.get(old_labels)
+            if transitions is None:
+                largest_old = max(old_labels, default=0)
+                computed: list[tuple[tuple[int, ...], int]] = []
+                for selected in (False, True):
+                    merge_mask = 0
+                    if selected:
+                        for position in touch_positions:
+                            label = old_labels[position]
+                            if label:
+                                merge_mask |= 1 << (label - 1)
+                    if selected and merge_mask:
+                        current_token = (merge_mask & -merge_mask).bit_length()
+                    elif selected:
+                        current_token = largest_old + 1
                     else:
-                        first_for_label[label] = v
-                if selected:
-                    for other in model.graph[i]:
-                        p = old_position.get(other)
-                        if p is not None and old_labels[p] != 0:
-                            union(i, other)
+                        current_token = 0
 
-                outgoing_roots: list[int | None] = []
-                represented_roots: set[int] = set()
-                for v in new_boundary:
-                    is_selected = selected if v == i else (
-                        old_labels[old_position[v]] != 0
+                    outgoing_tokens = [
+                        old_labels[source] if source >= 0 else 0
+                        for source in source_positions
+                    ]
+                    if merge_mask:
+                        for position, token in enumerate(outgoing_tokens):
+                            if token and merge_mask & (1 << (token - 1)):
+                                outgoing_tokens[position] = current_token
+                    if selected:
+                        for position in activate_positions:
+                            outgoing_tokens[position] = current_token
+
+                    represented_mask = 0
+                    for token in outgoing_tokens:
+                        if token:
+                            represented_mask |= 1 << (token - 1)
+                    all_components = (1 << largest_old) - 1 if largest_old else 0
+                    if merge_mask:
+                        all_components = (
+                            (all_components & ~merge_mask)
+                            | (1 << (current_token - 1))
+                        )
+                    elif selected:
+                        all_components |= 1 << (current_token - 1)
+                    closed = (all_components & ~represented_mask).bit_count()
+                    labels = _canonical_tokens(
+                        outgoing_tokens, max(largest_old, current_token)
                     )
-                    if is_selected:
-                        root = find(v)
-                        outgoing_roots.append(root)
-                        represented_roots.add(root)
-                    else:
-                        outgoing_roots.append(None)
-                all_roots = {find(v) for v in nodes}
-                closed_components = len(all_roots - represented_roots)
-                new_labels = _canonical_labels(outgoing_roots)
+                    computed.append((labels, closed))
+                transitions = (computed[0], computed[1])
+                connectivity_cache[old_labels] = transitions
 
-                hit_by_factor = {
-                    f_id: bool(old_hits & (1 << p))
-                    for f_id, p in incoming_factor_pos.items()
-                }
-                for f_id in member_factors:
-                    hit_by_factor[f_id] = hit_by_factor.get(f_id, False) or selected
+            for selected in (False, True):
+                new_labels, closed_components = transitions[int(selected)]
 
+                new_hits = old_hits
                 factor_cost = 0
-                for f_id in member_factors:
-                    if factor_max[f_id] != i:
-                        continue
-                    hit = hit_by_factor[f_id]
-                    factor_cost += hit if factors[f_id].kind == "flag" else not hit
-
-                new_hits = 0
-                for p, f_id in enumerate(outgoing_factors):
-                    if hit_by_factor.get(f_id, False):
-                        new_hits |= 1 << p
+                if selected:
+                    newly_hit = member_mask & ~old_hits
+                    factor_cost = (newly_hit & flag_factor_mask).bit_count()
+                    factor_cost -= (newly_hit & base_factor_mask).bit_count()
+                    new_hits |= member_mask
+                new_hits &= active_after
 
                 new_cost = old_cost + int(selected) + closed_components + factor_cost
                 state = (new_labels, new_hits)
@@ -639,10 +824,26 @@ def solve_frontier(
                 if previous is None or new_cost < previous[0]:
                     next_table[state] = (new_cost, new_mask)
 
-        table = next_table
+        table, removed = _prune_dominated(
+            next_table,
+            dominance_comparisons,
+            base_factor_mask,
+            active_after,
+        )
+        dominated_total += removed
         peak_states = max(peak_states, len(table))
         max_boundary_vertices = max(max_boundary_vertices, len(new_boundary))
-        max_active_count = max(max_active_count, len(outgoing_factors))
+        active_count = active_after.bit_count()
+        max_active_count = max(max_active_count, active_count)
+        if progress and ((i + 1) % progress_every == 0 or i + 1 == n):
+            print(
+                f"DP: region contains {region_ranks[i]}/{model.height * model.width} tiles; "
+                f"processed {i + 1}/{n} chord candidates; "
+                f"{len(table):,} valid boundary states; boundary "
+                f"{len(new_boundary)} connectivity items + {active_count} factor bits; "
+                f"pruned {dominated_total:,} dominated states",
+                file=output,
+            )
         if len(table) > max_states:
             raise StateLimitExceeded(
                 f"frontier grew to {len(table):,} states after variable {i + 1}/{n}; "
@@ -672,8 +873,13 @@ def evaluate_set(model: Model, selected: set[int]) -> tuple[int, set[Coord], lis
         for mine, scope in zip(sorted(model.mines), model.mine_scopes)
         if selected.intersection(scope)
     }
+    zero_memberships: list[list[int]] = [[] for _ in model.candidates]
+    for zero_id, scope in enumerate(model.zero_scopes):
+        for candidate in scope:
+            zero_memberships[candidate].append(zero_id)
     components: list[list[int]] = []
     unseen = set(selected)
+    unused_zeros = set(range(len(model.zero_scopes)))
     while unseen:
         start = unseen.pop()
         component = [start]
@@ -685,6 +891,15 @@ def evaluate_set(model: Model, selected: set[int]) -> tuple[int, set[Coord], lis
                     unseen.remove(other)
                     component.append(other)
                     queue.append(other)
+            for zero_id in zero_memberships[v]:
+                if zero_id not in unused_zeros:
+                    continue
+                unused_zeros.remove(zero_id)
+                for other in model.zero_scopes[zero_id]:
+                    if other in unseen:
+                        unseen.remove(other)
+                        component.append(other)
+                        queue.append(other)
         components.append(sorted(component))
     components.sort(key=lambda comp: model.candidates[comp[0]])
     uncovered = [
@@ -700,6 +915,11 @@ def _component_chord_order(model: Model, component: list[int]) -> list[int]:
     order = []
     seen = {seed}
     queue = deque([seed])
+    zero_memberships: list[list[int]] = [[] for _ in model.candidates]
+    for zero_id, scope in enumerate(model.zero_scopes):
+        for candidate in scope:
+            zero_memberships[candidate].append(zero_id)
+    unused_zeros = set(range(len(model.zero_scopes)))
     while queue:
         v = queue.popleft()
         order.append(v)
@@ -707,6 +927,16 @@ def _component_chord_order(model: Model, component: list[int]) -> list[int]:
             if other in allowed and other not in seen:
                 seen.add(other)
                 queue.append(other)
+        for zero_id in zero_memberships[v]:
+            if zero_id not in unused_zeros:
+                continue
+            unused_zeros.remove(zero_id)
+            for other in sorted(
+                model.zero_scopes[zero_id], key=lambda i: model.candidates[i]
+            ):
+                if other in allowed and other not in seen:
+                    seen.add(other)
+                    queue.append(other)
     if len(order) != len(component):
         raise AssertionError("reported chord component is disconnected")
     return order
@@ -820,6 +1050,7 @@ def solution_as_dict(model: Model, solution: Solution, offset: int) -> dict[str,
             {"action": action, "row": cell[0] + offset, "column": cell[1] + offset}
             for action, cell in solution.actions
         ],
+        "clicks": [list(click) for click in click_tuples(solution, offset)],
         "statistics": {
             "candidate_chords": len(model.candidates),
             "selected_chords": len(solution.selected),
@@ -838,6 +1069,15 @@ def _format_coord(cell: Coord, offset: int) -> str:
     return f"({cell[0] + offset},{cell[1] + offset})"
 
 
+def click_tuples(solution: Solution, offset: int = 1) -> list[tuple[str, int, int]]:
+    """Return the executable solution as (click_type, x, y) tuples."""
+    click_name = {"flag": "right", "left": "left", "chord": "chord"}
+    return [
+        (click_name[action], cell[1] + offset, cell[0] + offset)
+        for action, cell in solution.actions
+    ]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -854,11 +1094,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--method", choices=("frontier", "bruteforce"), default="frontier"
     )
     parser.add_argument("--order", choices=("auto", "rows", "columns"), default="auto")
+    parser.add_argument(
+        "--band-size",
+        type=int,
+        help="spatial sweep band width/height (auto tries several sizes)",
+    )
     parser.add_argument("--max-states", type=int, default=2_000_000)
+    parser.add_argument(
+        "--progress", action="store_true", help="print DP frontier progress to stderr"
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=10,
+        metavar="CANDIDATES",
+        help="progress interval (default: 10 chord candidates)",
+    )
+    parser.add_argument(
+        "--dominance-comparisons",
+        type=int,
+        default=1_000_000,
+        help="maximum dominance checks per DP layer; 0 disables pruning",
+    )
     parser.add_argument(
         "--verify", action="store_true", help="compare with brute force when small"
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable output")
+    parser.add_argument(
+        "--click-tuples",
+        action="store_true",
+        help="emit only a list of (click_type, x, y) tuples",
+    )
     parser.add_argument("--zero-based", action="store_true")
     args = parser.parse_args(argv)
 
@@ -868,7 +1134,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.method == "bruteforce":
             solution = solve_bruteforce(model)
         else:
-            solution = solve_frontier(model, args.order, args.max_states)
+            solution = solve_frontier(
+                model,
+                args.order,
+                args.max_states,
+                band_size=args.band_size,
+                progress=args.progress,
+                progress_every=args.progress_every,
+                dominance_comparisons=args.dominance_comparisons,
+            )
         if args.verify and len(model.candidates) <= 25:
             brute = solve_bruteforce(model)
             if brute.clicks != solution.clicks:
@@ -879,6 +1153,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(str(exc))
 
     offset = 0 if args.zero_based else 1
+    if args.click_tuples:
+        print(click_tuples(solution, offset))
+        return 0
     data = solution_as_dict(model, solution, offset)
     if args.json:
         print(json.dumps(data, indent=2))
@@ -895,7 +1172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if solution.order_name != "brute-force":
         print(
             f"DP: {solution.order_name} order, {solution.peak_states:,} peak states, "
-            f"boundary {solution.max_boundary_vertices} chord vertices + "
+            f"boundary {solution.max_boundary_vertices} connectivity items + "
             f"{solution.max_active_factors} factor bits"
         )
     print("Actions:")

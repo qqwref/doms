@@ -79,13 +79,27 @@ If automatic detection is ever inconvenient, use `--format grid`,
 The output gives the optimal count, its breakdown, DP statistics, and a valid
 action sequence. Coordinates are 1-based. Use `--zero-based` to change that.
 
+To print only the executable clicks as `(click_type, x, y)` tuples, use:
+
+```console
+python minesweeper_chord_dp.py board.txt --click-tuples
+```
+
+The click types are `left`, `right`, and `chord`; `right` places a flag. The
+same list is included as the `clicks` field in `--json` output. In JSON, each
+tuple is naturally represented as an array.
+
 Useful options:
 
 ```console
 python minesweeper_chord_dp.py board.txt --json
+python minesweeper_chord_dp.py board.txt --click-tuples
 python minesweeper_chord_dp.py board.txt --verify
 python minesweeper_chord_dp.py board.txt --order rows
 python minesweeper_chord_dp.py board.txt --order columns
+python minesweeper_chord_dp.py board.txt --band-size 2
+python minesweeper_chord_dp.py board.txt --progress
+python minesweeper_chord_dp.py board.txt --progress --progress-every 5
 python minesweeper_chord_dp.py board.txt --max-states 5000000
 python minesweeper_chord_dp.py board.txt --method bruteforce
 ```
@@ -125,21 +139,67 @@ chord on that square or an adjacent square.
 
 ## Frontier state
 
-Candidates are processed in row or column order. At each cut the state stores:
+Candidates are processed in a spatial sweep. At each cut the state stores:
 
-- which processed chord candidates still touch an unprocessed candidate;
+- which processed chord candidates still touch an unprocessed candidate, plus
+  one connector for each zero opening that crosses the boundary;
 - a canonical partition saying which of those boundary candidates are already
   connected through selected chords in the processed region; and
 - one bit for every mine/3BV OR-factor whose candidate scope crosses the cut,
   recording whether a selected chord has already hit it.
 
-When the last boundary vertex of a selected component disappears, the DP adds
+The zero connector is important: it represents the propagation hyperedge
+without materializing a clique between every pair of chord squares around a
+large opening. When the last boundary item of a selected component disappears, the DP adds
 one seed click. When the last variable of a factor is processed, it adds either
 the required flag cost or the uncovered-3BV cost. Equivalent boundary states
 are merged, retaining only the cheapest partial chord set.
 
-The implementation tries both row and column layouts cheaply and chooses the
-one with the smaller estimated frontier. Runtime is still exponential in the
-frontier size, so unusually wide or highly connected boards can exceed the
-state limit. In that case, try the other order or raise `--max-states` if memory
+All 3BV units, direct chord adjacency, zero-opening membership, and mine/3BV
+factor membership are precomputed. Hot transitions use integer bitsets and
+`bit_count()` rather than allocating factor objects or dictionaries. A cached
+connectivity transition is shared by all states having the same boundary
+partition.
+
+The DP also performs exact Pareto pruning. For equal connectivity, a state can
+be discarded when another state has a superset of future-useful hits at a
+provably sufficient cost advantage. In particular, flags that have already
+been paid for are useful resources for later chords. Covered 3BV units require
+an additional potential-cost check because their saving has already been
+credited. `--dominance-comparisons 0` disables this pruning; the default caps
+its work per layer so pruning itself cannot grow without bound.
+
+The implementation estimates both row and column layouts. It also tests wider
+bands when the width estimate shows a clear improvement; `--band-size N`
+forces both orientations to be compared at a requested band size. A band of
+one eagerly merges states after each tile and is normally fastest, while some
+boards benefit dramatically from a wider band. `--progress` prints the swept
+tile count, processed chord candidates, valid boundary states, live boundary
+size, and cumulative dominance pruning to standard error.
+
+Runtime remains exponential in frontier size, so unusually wide or highly
+connected boards can exceed the state limit. In that case, try a specific
+`--order`, experiment with `--band-size`, or raise `--max-states` if memory
 allows.
+
+More precisely, let `N = n*m`, let `q <= N-k` be the number of possible chord
+squares, `b` the maximum number of live chord/zero-connector items at a cut,
+and `f` the maximum number of live mine/3BV factors. If `B(i)` is the `i`th Bell
+number, the number of retained states is bounded by
+
+```text
+S <= min(2^q, B(b + 1) * 2^f).
+```
+
+Ignoring the explicitly capped dominance checks, the optimized implementation
+takes approximately `O(q*S*b)` time and `O(S*(b+q))` memory; cached connectivity
+often makes the observed transition cost much smaller. Precomputation is
+polynomial (`O(N + qF + q(q+z))` in this implementation, where `F` is the total
+factor count and `z` the number of zero regions).
+
+On a narrow grid with local interactions, `b,f = O(min(n,m))`, yielding the
+usual frontier-DP form
+`N * 2^O(min(n,m) log(min(n,m)))`. The strict worst case is still exponential:
+since `q <= N-k`, a simple board-size bound is
+`O(poly(N) * 2^(N-k))` time and exponential memory. The default two-million
+state limit stops the solver before that worst case consumes unbounded memory.

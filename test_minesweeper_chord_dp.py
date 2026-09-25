@@ -1,8 +1,11 @@
+import io
 import random
 import unittest
 
 from minesweeper_chord_dp import (
+    Solution,
     build_model,
+    click_tuples,
     load_board,
     parse_board,
     parse_llamasweeper,
@@ -35,6 +38,37 @@ class ChordDpTests(unittest.TestCase):
     def test_simple_chord(self):
         model, solution = self.solve("*..\n...\n...\n")
         self.assertLessEqual(solution.clicks, model.three_bv)
+
+    def test_progress_and_band_order(self):
+        height, width, mines = parse_board("*...\n....\n..*.\n....\n")
+        model = build_model(height, width, mines)
+        stream = io.StringIO()
+        solution = solve_frontier(
+            model,
+            order="rows",
+            band_size=2,
+            progress=True,
+            progress_every=2,
+            progress_stream=stream,
+        )
+        self.assertEqual(solution.clicks, solve_bruteforce(model).clicks)
+        self.assertEqual(solution.order_name, "rows-band-2")
+        output = stream.getvalue()
+        self.assertIn("region contains", output)
+        self.assertIn("valid boundary states", output)
+
+    def test_zero_openings_are_hyperedges_not_cliques(self):
+        model = build_model(4, 4, {(1, 2), (3, 0), (3, 3)})
+        self.assertTrue(model.zero_scopes)
+        largest = max(model.zero_scopes, key=len)
+        self.assertGreater(len(largest), 2)
+        self.assertTrue(
+            any(b not in model.graph[a] for a in largest for b in largest if a != b)
+        )
+        self.assertEqual(
+            solve_frontier(model).clicks,
+            solve_bruteforce(model).clicks,
+        )
 
     def test_llamasweeper_standard_board(self):
         url = (
@@ -81,6 +115,24 @@ class ChordDpTests(unittest.TestCase):
             parse_llamasweeper("b=43&m=001")
         with self.assertRaisesRegex(ValueError, "declares"):
             parse_mbf("04 03 00 02 00 00")
+
+    def test_click_tuple_output(self):
+        solution = Solution(
+            clicks=3,
+            selected=set(),
+            flags=set(),
+            components=[],
+            uncovered_units=[],
+            actions=[("flag", (2, 4)), ("left", (0, 1)), ("chord", (3, 2))],
+        )
+        self.assertEqual(
+            click_tuples(solution),
+            [("right", 5, 3), ("left", 2, 1), ("chord", 3, 4)],
+        )
+        self.assertEqual(
+            click_tuples(solution, offset=0),
+            [("right", 4, 2), ("left", 1, 0), ("chord", 2, 3)],
+        )
 
     def test_random_small_boards(self):
         rng = random.Random(20260921)
