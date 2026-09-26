@@ -556,7 +556,16 @@ static std::vector<int> order_indices(const Model& model, const std::string& nam
     return order;
 }
 
-using WidthEstimate = std::tuple<int, int, int>;
+using WidthEstimate = std::tuple<int, int, int, uint64_t>;
+
+static uint64_t saturated_add(uint64_t a, uint64_t b) {
+    return a > std::numeric_limits<uint64_t>::max() - b
+        ? std::numeric_limits<uint64_t>::max() : a + b;
+}
+
+static uint64_t estimated_cut_work(int width) {
+    return uint64_t{1} << std::min(width, 60);
+}
 
 static WidthEstimate width_estimate(const Model& model, const std::vector<int>& order) {
     const int q = static_cast<int>(order.size());
@@ -599,6 +608,7 @@ static WidthEstimate width_estimate(const Model& model, const std::vector<int>& 
     int max_graph = 0;
     int max_factors = 0;
     int max_total = 0;
+    uint64_t work = 0;
     for (int cut = 0; cut < std::max(0, q - 1); ++cut) {
         int graph = 0;
         int factors = 0;
@@ -607,8 +617,213 @@ static WidthEstimate width_estimate(const Model& model, const std::vector<int>& 
         max_graph = std::max(max_graph, graph);
         max_factors = std::max(max_factors, factors);
         max_total = std::max(max_total, graph + factors);
+        work = saturated_add(work, estimated_cut_work(graph + factors));
     }
-    return {max_total, max_graph, max_factors};
+    return {max_total, max_graph, max_factors, work};
+}
+
+// Optimize the order inside each row or column while retaining the global
+// strip sweep.  A 16-row expert board has at most 16 candidates in a column,
+// so an exact subset DP over the possible partial-column cuts is inexpensive.
+static std::vector<int> smart_line_order_indices(const Model& model,
+                                                 const std::string& name) {
+    const bool by_columns = name == "columns";
+    if (!by_columns && name != "rows") throw UserError("unknown smart order '" + name + "'");
+    const int q = static_cast<int>(model.candidates.size());
+    const int line_count = by_columns ? model.width : model.height;
+    auto primary = [&](int candidate) {
+        const int cell = model.candidates[candidate];
+        return by_columns ? cell % model.width : cell / model.width;
+    };
+    auto secondary = [&](int candidate) {
+        const int cell = model.candidates[candidate];
+        return by_columns ? cell / model.width : cell % model.width;
+    };
+
+    std::vector<std::vector<int>> lines(line_count);
+    for (int candidate = 0; candidate < q; ++candidate) {
+        lines[primary(candidate)].push_back(candidate);
+    }
+    for (auto& line : lines) {
+        std::sort(line.begin(), line.end(), [&](int a, int b) {
+            return secondary(a) < secondary(b);
+        });
+    }
+
+    std::vector<int> result;
+    result.reserve(q);
+    for (int line_number = 0; line_number < line_count; ++line_number) {
+        const auto& line = lines[line_number];
+        const int p = static_cast<int>(line.size());
+        if (p <= 1) {
+            result.insert(result.end(), line.begin(), line.end());
+            continue;
+        }
+        // Wide rows can make 2^p impractical.  The important expert-board
+        // case is a column of at most 16 candidates.
+        if (p > 20) {
+            result.insert(result.end(), line.begin(), line.end());
+            continue;
+        }
+
+        const uint32_t state_count = uint32_t{1} << p;
+        const uint32_t all = state_count - 1;
+        std::vector<int> local_bit(q, -1);
+        for (int bit = 0; bit < p; ++bit) local_bit[line[bit]] = bit;
+
+        auto crossing_counts = [&](const std::vector<std::vector<int>>& first,
+                                   const std::vector<std::vector<int>>* second = nullptr) {
+            std::vector<int> before_only(state_count, 0);
+            std::vector<int> after_only(state_count, 0);
+            std::vector<int> current_only(state_count, 0);
+            int always = 0;
+            int before_total = 0;
+            int after_total = 0;
+            int current_total = 0;
+            auto add_scope = [&](const std::vector<int>& scope) {
+                bool before = false;
+                bool after = false;
+                uint32_t mask = 0;
+                for (int candidate : scope) {
+                    const int candidate_line = primary(candidate);
+                    if (candidate_line < line_number) before = true;
+                    else if (candidate_line > line_number) after = true;
+                    else mask |= uint32_t{1} << local_bit[candidate];
+                }
+                if (before && after) ++always;
+                else if (before) {
+                    ++before_only[mask];
+                    ++before_total;
+                } else if (after) {
+                    ++after_only[mask];
+                    ++after_total;
+                } else if (mask) {
+                    ++current_only[mask];
+                    ++current_total;
+                }
+            };
+            for (const auto& scope : first) if (!scope.empty()) add_scope(scope);
+            if (second) for (const auto& scope : *second) if (!scope.empty()) add_scope(scope);
+            auto zeta = [&](std::vector<int>& counts) {
+                for (int bit = 0; bit < p; ++bit) {
+                    for (uint32_t mask = 0; mask < state_count; ++mask) {
+                        if (mask & (uint32_t{1} << bit)) {
+                            counts[mask] += counts[mask ^ (uint32_t{1} << bit)];
+                        }
+                    }
+                }
+            };
+            zeta(before_only);
+            zeta(after_only);
+            zeta(current_only);
+            std::vector<int> answer(state_count, always);
+            for (uint32_t mask = 0; mask < state_count; ++mask) {
+                answer[mask] += before_total - before_only[mask];
+                answer[mask] += after_total - after_only[all ^ mask];
+                answer[mask] += current_total - current_only[mask]
+                    - current_only[all ^ mask];
+            }
+            return answer;
+        };
+
+        std::vector<int> graph_cost = crossing_counts(model.zero_scopes);
+        std::vector<int> factor_cost = crossing_counts(model.mine_scopes, &model.base_scopes);
+
+        // Candidate connectivity vertices are live when the vertex has been
+        // processed but at least one graph neighbor has not.
+        std::vector<int> old_masks(state_count, 0);
+        int old_total = 0;
+        int old_always = 0;
+        for (int candidate = 0; candidate < q; ++candidate) {
+            if (primary(candidate) >= line_number) continue;
+            bool later = false;
+            uint32_t mask = 0;
+            for (int neighbor : model.graph[candidate]) {
+                const int neighbor_line = primary(neighbor);
+                if (neighbor_line > line_number) later = true;
+                else if (neighbor_line == line_number) {
+                    mask |= uint32_t{1} << local_bit[neighbor];
+                }
+            }
+            if (later) ++old_always;
+            else if (mask) {
+                ++old_masks[mask];
+                ++old_total;
+            }
+        }
+        for (int bit = 0; bit < p; ++bit) {
+            for (uint32_t mask = 0; mask < state_count; ++mask) {
+                if (mask & (uint32_t{1} << bit)) {
+                    old_masks[mask] += old_masks[mask ^ (uint32_t{1} << bit)];
+                }
+            }
+        }
+        std::vector<uint32_t> same_line_neighbors(p, 0);
+        std::vector<uint8_t> has_later_neighbor(p, 0);
+        for (int bit = 0; bit < p; ++bit) {
+            for (int neighbor : model.graph[line[bit]]) {
+                const int neighbor_line = primary(neighbor);
+                if (neighbor_line > line_number) has_later_neighbor[bit] = 1;
+                else if (neighbor_line == line_number) {
+                    same_line_neighbors[bit] |= uint32_t{1} << local_bit[neighbor];
+                }
+            }
+        }
+        for (uint32_t mask = 0; mask < state_count; ++mask) {
+            graph_cost[mask] += old_always + old_total - old_masks[mask];
+            uint32_t selected = mask;
+            while (selected) {
+                const int bit = __builtin_ctz(selected);
+                selected &= selected - 1;
+                if (has_later_neighbor[bit] || (same_line_neighbors[bit] & ~mask & all)) {
+                    ++graph_cost[mask];
+                }
+            }
+        }
+
+        struct PathScore {
+            int max_total = std::numeric_limits<int>::max();
+            int max_graph = std::numeric_limits<int>::max();
+            int max_factors = std::numeric_limits<int>::max();
+            uint64_t work = std::numeric_limits<uint64_t>::max();
+        };
+        auto less_score = [](const PathScore& a, const PathScore& b) {
+            return std::tie(a.max_total, a.max_graph, a.max_factors, a.work) <
+                   std::tie(b.max_total, b.max_graph, b.max_factors, b.work);
+        };
+        std::vector<PathScore> best(state_count);
+        std::vector<int8_t> predecessor(state_count, -1);
+        best[0] = {graph_cost[0] + factor_cost[0], graph_cost[0], factor_cost[0],
+                   estimated_cut_work(graph_cost[0] + factor_cost[0])};
+        for (uint32_t mask = 1; mask < state_count; ++mask) {
+            uint32_t choices = mask;
+            while (choices) {
+                const int bit = __builtin_ctz(choices);
+                choices &= choices - 1;
+                const uint32_t previous = mask ^ (uint32_t{1} << bit);
+                PathScore score = best[previous];
+                const int total = graph_cost[mask] + factor_cost[mask];
+                score.max_total = std::max(score.max_total, total);
+                score.max_graph = std::max(score.max_graph, graph_cost[mask]);
+                score.max_factors = std::max(score.max_factors, factor_cost[mask]);
+                score.work = saturated_add(score.work, estimated_cut_work(total));
+                if (predecessor[mask] < 0 || less_score(score, best[mask])) {
+                    best[mask] = score;
+                    predecessor[mask] = static_cast<int8_t>(bit);
+                }
+            }
+        }
+        std::vector<int> reversed;
+        reversed.reserve(p);
+        for (uint32_t mask = all; mask; ) {
+            const int bit = predecessor[mask];
+            reversed.push_back(line[bit]);
+            mask ^= uint32_t{1} << bit;
+        }
+        std::reverse(reversed.begin(), reversed.end());
+        result.insert(result.end(), reversed.begin(), reversed.end());
+    }
+    return result;
 }
 
 static std::vector<int> candidate_band_sizes(int size) {
@@ -627,6 +842,12 @@ static std::pair<Model, std::string> choose_order(const Model& model,
                                                    const std::string& requested,
                                                    std::optional<int> band_size) {
     if (requested != "auto") {
+        if (requested == "columns-smart" || requested == "rows-smart") {
+            if (band_size) throw UserError("--band-size cannot be combined with a smart order");
+            const std::string base = requested.substr(0, requested.find('-'));
+            auto order = smart_line_order_indices(model, base);
+            return {ordered_model(model, order), requested};
+        }
         const int size = band_size.value_or(1);
         auto order = order_indices(model, requested, size);
         const std::string name = size == 1 ? requested : requested + "-band-" + std::to_string(size);
@@ -635,11 +856,24 @@ static std::pair<Model, std::string> choose_order(const Model& model,
     std::vector<OrderChoice> choices;
     int standard_best = std::numeric_limits<int>::max();
     if (!band_size) {
+        std::vector<std::pair<std::string, WidthEstimate>> standard_estimates;
         for (const std::string name : {"columns", "rows"}) {
             auto order = order_indices(model, name, 1);
             auto estimate = width_estimate(model, order);
             standard_best = std::min(standard_best, std::get<0>(estimate));
             choices.push_back({estimate, name, std::move(order)});
+            standard_estimates.emplace_back(name, estimate);
+        }
+        for (const auto& [name, standard_estimate] : standard_estimates) {
+            const int physical_line_size = name == "columns" ? model.height : model.width;
+            // Do not spend 2^p preprocessing time on the long-axis sweep, or
+            // on an orientation whose ordinary estimate is already clearly
+            // inferior.  Explicit rows-smart/columns-smart remains available.
+            if (physical_line_size > 20 ||
+                std::get<0>(standard_estimate) > standard_best + 2) continue;
+            auto smart_order = smart_line_order_indices(model, name);
+            auto smart_estimate = width_estimate(model, smart_order);
+            choices.push_back({smart_estimate, name + "-smart", std::move(smart_order)});
         }
     }
     std::vector<std::pair<std::string, int>> candidates;
@@ -2033,7 +2267,7 @@ static void print_help(const char* program) {
         << "  --seed N                       Reproduce a generated board\n"
         << "  --format auto|grid|llamasweeper|mbf\n"
         << "  --method frontier|bruteforce\n"
-        << "  --order auto|rows|columns\n"
+        << "  --order auto|rows|columns|rows-smart|columns-smart\n"
         << "  --band-size N\n"
         << "  --max-states N\n"
         << "  --progress [--progress-every N]\n"
@@ -2111,7 +2345,8 @@ static Options parse_options(int argc, char** argv) {
     if (options.method != "frontier" && options.method != "bruteforce") {
         throw UserError("invalid --method value");
     }
-    if (options.order != "auto" && options.order != "rows" && options.order != "columns") {
+    if (options.order != "auto" && options.order != "rows" && options.order != "columns" &&
+        options.order != "rows-smart" && options.order != "columns-smart") {
         throw UserError("invalid --order value");
     }
     if (options.json && options.click_tuples) throw UserError("choose only one of --json and --click-tuples");
