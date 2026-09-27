@@ -56,8 +56,9 @@ The resulting executable does not require Python.
 
 ## Quick start
 
-Pass a board as the first argument. For example, to solve a LlamaSweeper board
-and print the exact clicks as `(click_type, x, y)` tuples:
+Pass a board as the first argument. For example, to solve a PTTACG-encoded board
+from a LlamaSweeper URL and print the exact clicks as `(click_type, x, y)`
+tuples:
 
 ```console
 ./doms "https://llamasweeper.com/#/game/board-editor?b=2&m=000g14s0010421g080414h4540a0g8880kg200800080o5400c00" --click-tuples
@@ -113,7 +114,7 @@ and recalculated from the mine positions.
 ./doms board.txt --format grid
 ```
 
-### LlamaSweeper URL
+### PTTACG string or compatible LlamaSweeper URL
 
 Complete board-editor URLs and bare `b=...&m=...` parameter strings are
 accepted:
@@ -121,6 +122,16 @@ accepted:
 ```console
 ./doms "https://llamasweeper.com/#/game/board-editor?b=2&m=0000000000000000220c8014k0pg0i80h30cc01140oo0ii0hh00"
 ```
+
+This board-string format was created by
+[PTTACGfans](https://github.com/PTTACGfans) for the
+[Minesweeper ZiNi Calculator](https://pttacgfans.github.io/Minesweeper-ZiNi-Calculator/)
+([source code](https://github.com/PTTACGfans/Minesweeper-ZiNi-Calculator)).
+LlamaSweeper supports the format but did not originate it. This README refers
+to these encodings as **PTTACG strings**.
+
+For command-line compatibility, the forced parser name remains
+`--format llamasweeper`.
 
 The standard board codes are:
 
@@ -162,8 +173,8 @@ Expert board:
 ```
 
 Intermediate boards are 16 x 16 with 40 mines. Expert boards are 30 x 16 with
-99 mines. The generated LlamaSweeper URL and random seed are printed before the
-solve.
+99 mines. The generated PTTACG string, embedded in a compatible LlamaSweeper
+board-editor URL, and the random seed are printed before the solve.
 
 Use `--seed` for a reproducible board:
 
@@ -172,7 +183,7 @@ Use `--seed` for a reproducible board:
 ```
 
 Seeded generation is reproducible across C++ standard-library implementations.
-The printed LlamaSweeper URL is the most portable way to preserve a generated
+The printed PTTACG board URL is the most portable way to preserve a generated
 board.
 
 ## Output formats and coordinates
@@ -233,8 +244,8 @@ JSON output includes:
 ```text
 Usage: doms [BOARD] [options]
 
-BOARD may be a grid filename, LlamaSweeper URL, MBF filename,
-or quoted MBF hexadecimal.
+BOARD may be a grid filename, PTTACG string or compatible LlamaSweeper URL,
+MBF filename, or quoted MBF hexadecimal.
 ```
 
 | Option | Meaning |
