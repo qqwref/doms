@@ -255,12 +255,12 @@ static Board parse_llamasweeper(const std::string& source) {
     return board;
 }
 
-static std::string format_llamasweeper_url(const Board& board) {
+static std::string format_pttacg_string(const Board& board) {
     std::string code;
     if (board.height == 9 && board.width == 9) code = "1";
     else if (board.height == 16 && board.width == 16) code = "2";
     else if (board.height == 16 && board.width == 30) code = "3";
-    else throw UserError("LlamaSweeper URL output supports only standard dimensions");
+    else throw UserError("PTTACG output supports only standard dimensions");
     std::string mine_code;
     for (size_t start = 0; start < board.mines.size(); start += 5) {
         unsigned value = 0;
@@ -270,7 +270,11 @@ static std::string format_llamasweeper_url(const Board& board) {
         }
         mine_code.push_back(LLAMA_ALPHABET[value]);
     }
-    return "https://llamasweeper.com/#/game/board-editor?b=" + code + "&m=" + mine_code;
+    return "b=" + code + "&m=" + mine_code;
+}
+
+static std::string format_llamasweeper_url(const Board& board) {
+    return "https://llamasweeper.com/#/game/board-editor?" + format_pttacg_string(board);
 }
 
 static std::vector<std::string> split_tokens(const std::string& text) {
@@ -366,23 +370,33 @@ static Board load_board(const std::string& source, const std::string& format) {
     return parse_grid(raw);
 }
 
-static Board generate_standard_board(const std::string& difficulty,
-                                     std::optional<uint64_t> seed,
-                                     uint64_t& effective_seed) {
+static std::tuple<int, int, int> standard_board_spec(const std::string& difficulty) {
     int height, width, mine_count;
-    if (difficulty == "intermediate") {
+    if (difficulty == "beginner") {
+        height = 9; width = 9; mine_count = 10;
+    } else if (difficulty == "intermediate") {
         height = 16; width = 16; mine_count = 40;
     } else if (difficulty == "expert") {
         height = 16; width = 30; mine_count = 99;
     } else {
         throw UserError("unknown generated difficulty '" + difficulty + "'");
     }
-    if (seed) effective_seed = *seed;
-    else {
-        std::random_device rd;
-        effective_seed = (static_cast<uint64_t>(rd()) << 32) ^ rd();
+    return {height, width, mine_count};
+}
+
+static uint64_t random_seed() {
+    std::random_device rd;
+    uint64_t seed = 0;
+    for (int i = 0; i < 4; ++i) {
+        seed ^= static_cast<uint64_t>(rd()) << (16 * i);
+        seed = seed * UINT64_C(0x9e3779b97f4a7c15) + UINT64_C(0xbf58476d1ce4e5b9);
     }
-    std::mt19937_64 rng(effective_seed);
+    return seed;
+}
+
+static Board generate_standard_board(const std::string& difficulty,
+                                     std::mt19937_64& rng) {
+    const auto [height, width, mine_count] = standard_board_spec(difficulty);
     std::vector<int> cells(height * width);
     std::iota(cells.begin(), cells.end(), 0);
     auto bounded_random = [&](uint64_t bound) {
@@ -400,6 +414,14 @@ static Board generate_standard_board(const std::string& difficulty,
     Board board{height, width, std::vector<uint8_t>(height * width, 0)};
     for (int i = 0; i < mine_count; ++i) board.mines[cells[i]] = 1;
     return board;
+}
+
+static Board generate_standard_board(const std::string& difficulty,
+                                     std::optional<uint64_t> seed,
+                                     uint64_t& effective_seed) {
+    effective_seed = seed.value_or(random_seed());
+    std::mt19937_64 rng(effective_seed);
+    return generate_standard_board(difficulty, rng);
 }
 
 static Model build_model(const Board& board) {
@@ -2242,6 +2264,8 @@ static void print_click_tuples(const Model& model, const Solution& solution, int
 struct Options {
     std::optional<std::string> board;
     std::optional<std::string> generate;
+    std::optional<std::string> bulk;
+    size_t bulk_count = 0;
     std::optional<uint64_t> seed;
     std::string format = "auto";
     std::string method = "frontier";
@@ -2259,12 +2283,16 @@ struct Options {
 
 static void print_help(const char* program) {
     std::cout
-        << "Exact Minesweeper click optimizer (C++17)\n\n"
+        << "Deterministically Optimal Minesweeper Solver (DOMS, C++17)\n\n"
         << "Usage: " << program << " [BOARD] [options]\n\n"
-        << "BOARD may be a grid filename, LlamaSweeper URL, MBF filename, or quoted MBF hex.\n\n"
+        << "BOARD may be a grid filename, PTTACG string or compatible LlamaSweeper URL,\n"
+        << "MBF filename, or quoted MBF hex.\n\n"
         << "Options:\n"
-        << "  --generate intermediate|expert  Generate, print, and solve a random board\n"
-        << "  --seed N                       Reproduce a generated board\n"
+        << "  --generate beginner|intermediate|expert\n"
+        << "                                 Generate, print, and solve one random board\n"
+        << "  --bulk beginner|intermediate|expert COUNT\n"
+        << "                                 Generate and solve COUNT boards; write CSV\n"
+        << "  --seed N                       Reproduce generated or bulk boards\n"
         << "  --format auto|grid|llamasweeper|mbf\n"
         << "  --method frontier|bruteforce\n"
         << "  --order auto|rows|columns|rows-smart|columns-smart\n"
@@ -2299,6 +2327,14 @@ static int parse_positive_int(const std::string& value, const std::string& optio
     return static_cast<int>(parsed);
 }
 
+static size_t parse_positive_size(const std::string& value, const std::string& option) {
+    const uint64_t parsed = parse_u64(value, option);
+    if (parsed == 0 || parsed > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        throw UserError(option + " requires a positive integer");
+    }
+    return static_cast<size_t>(parsed);
+}
+
 static Options parse_options(int argc, char** argv) {
     Options options;
     auto value_after = [&](int& i, const std::string& option) {
@@ -2311,6 +2347,10 @@ static Options parse_options(int argc, char** argv) {
             print_help(argv[0]);
             std::exit(0);
         } else if (arg == "--generate") options.generate = value_after(i, arg);
+        else if (arg == "--bulk") {
+            options.bulk = value_after(i, arg);
+            options.bulk_count = parse_positive_size(value_after(i, arg), arg);
+        }
         else if (arg == "--seed") options.seed = parse_u64(value_after(i, arg), arg);
         else if (arg == "--format") options.format = value_after(i, arg);
         else if (arg == "--method") options.method = value_after(i, arg);
@@ -2328,15 +2368,31 @@ static Options parse_options(int argc, char** argv) {
         else if (options.board) throw UserError("only one board argument is allowed");
         else options.board = arg;
     }
-    if (options.generate) {
-        if (*options.generate != "intermediate" && *options.generate != "expert") {
-            throw UserError("--generate must be intermediate or expert");
+    const auto valid_difficulty = [](const std::string& difficulty) {
+        return difficulty == "beginner" || difficulty == "intermediate" ||
+               difficulty == "expert";
+    };
+    if (options.generate && options.bulk) {
+        throw UserError("choose only one of --generate and --bulk");
+    }
+    if (options.bulk) {
+        if (!valid_difficulty(*options.bulk)) {
+            throw UserError("--bulk must be beginner, intermediate, or expert");
+        }
+        if (options.board) throw UserError("do not supply a board argument with --bulk");
+        if (options.format != "auto") throw UserError("--format cannot be used with --bulk");
+        if (options.json || options.click_tuples) {
+            throw UserError("--bulk already writes CSV; do not combine it with --json or --click-tuples");
+        }
+    } else if (options.generate) {
+        if (!valid_difficulty(*options.generate)) {
+            throw UserError("--generate must be beginner, intermediate, or expert");
         }
         if (options.board) throw UserError("do not supply a board argument with --generate");
         if (options.format != "auto") throw UserError("--format cannot be used with --generate");
     } else {
-        if (!options.board) throw UserError("a board argument or --generate is required");
-        if (options.seed) throw UserError("--seed requires --generate");
+        if (!options.board) throw UserError("a board argument, --generate, or --bulk is required");
+        if (options.seed) throw UserError("--seed requires --generate or --bulk");
     }
     if (options.format != "auto" && options.format != "grid" &&
         options.format != "llamasweeper" && options.format != "mbf") {
@@ -2356,6 +2412,50 @@ static Options parse_options(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
+        if (options.bulk) {
+            const uint64_t master_seed = options.seed.value_or(random_seed());
+            std::mt19937_64 rng(master_seed);
+            std::cerr << "Bulk RNG: std::mt19937_64; seed: " << master_seed << "\n";
+            std::cout << "board,3bv,optimal_clicks\n";
+            const auto bulk_start = std::chrono::steady_clock::now();
+            for (size_t index = 0; index < options.bulk_count; ++index) {
+                Board board = generate_standard_board(*options.bulk, rng);
+                const std::string encoded = format_pttacg_string(board);
+                if (options.progress) {
+                    std::cerr << "Bulk board " << index + 1 << '/' << options.bulk_count
+                              << ": " << encoded << "\n";
+                }
+                try {
+                    Model model = build_model(board);
+                    Solution solution;
+                    if (options.method == "bruteforce") solution = solve_bruteforce(model);
+                    else {
+                        solution = solve_frontier(model, options.order, options.max_states,
+                                                  options.band_size, options.progress,
+                                                  options.progress_every,
+                                                  options.dominance_comparisons);
+                    }
+                    if (options.verify && model.candidates.size() <= 25) {
+                        const Solution brute = solve_bruteforce(model);
+                        if (brute.clicks != solution.clicks) {
+                            throw std::logic_error("frontier and brute-force results differ");
+                        }
+                    }
+                    std::cout << '"' << encoded << "\"," << model.three_bv() << ','
+                              << solution.clicks << '\n';
+                } catch (const std::exception& error) {
+                    throw UserError("bulk board " + std::to_string(index + 1) + "/" +
+                                    std::to_string(options.bulk_count) + " failed (" + encoded +
+                                    "): " + error.what());
+                }
+            }
+            const auto bulk_end = std::chrono::steady_clock::now();
+            const double seconds =
+                std::chrono::duration<double>(bulk_end - bulk_start).count();
+            std::cerr << "Bulk solve time: " << std::fixed << std::setprecision(3)
+                      << seconds << " seconds\n";
+            return 0;
+        }
         Board board;
         std::optional<std::string> generated_url;
         std::optional<uint64_t> generated_seed;

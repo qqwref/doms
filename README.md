@@ -164,17 +164,19 @@ mine count. It is followed by one `(x, y)` byte pair per mine.
 
 ### Random standard board
 
-The program can generate and immediately solve a standard Intermediate or
-Expert board:
+The program can generate and immediately solve a standard Beginner,
+Intermediate, or Expert board:
 
 ```console
+./doms --generate beginner
 ./doms --generate intermediate
 ./doms --generate expert --progress
 ```
 
-Intermediate boards are 16 x 16 with 40 mines. Expert boards are 30 x 16 with
-99 mines. The generated PTTACG string, embedded in a compatible LlamaSweeper
-board-editor URL, and the random seed are printed before the solve.
+Beginner boards are 9 x 9 with 10 mines. Intermediate boards are 16 x 16 with
+40 mines. Expert boards are 30 x 16 with 99 mines. The generated PTTACG string,
+embedded in a compatible LlamaSweeper board-editor URL, and the random seed are
+printed before the solve.
 
 Use `--seed` for a reproducible board:
 
@@ -185,6 +187,35 @@ Use `--seed` for a reproducible board:
 Seeded generation is reproducible across C++ standard-library implementations.
 The printed PTTACG board URL is the most portable way to preserve a generated
 board.
+
+### Bulk CSV generation
+
+Use `--bulk` with a difficulty and board count to generate and optimally solve
+many boards:
+
+```console
+./doms --bulk beginner 100 > beginner-results.csv
+./doms --bulk intermediate 25 > intermediate-results.csv
+./doms --bulk expert 10 > expert-results.csv
+```
+
+The CSV contains exactly these columns:
+
+```csv
+board,3bv,optimal_clicks
+"b=1&m=004g00a80g2005200",22,14
+```
+
+`board` is the bare PTTACG string. The CSV is written to standard output; the
+RNG seed, progress, and total elapsed time are written to standard error, so
+redirecting standard output produces a clean CSV file.
+
+Bulk generation uses `std::mt19937_64` and unbiased rejection sampling. Supply
+`--seed` to reproduce the complete sequence:
+
+```console
+./doms --bulk expert 10 --seed 8675309 > expert-results.csv
+```
 
 ## Output formats and coordinates
 
@@ -250,11 +281,12 @@ MBF filename, or quoted MBF hexadecimal.
 
 | Option | Meaning |
 | --- | --- |
-| `--generate intermediate\|expert` | Generate, print, and solve a random standard board. Do not also supply `BOARD`. |
-| `--seed N` | Reproduce a generated board. Requires `--generate`. |
+| `--generate beginner\|intermediate\|expert` | Generate, print, and solve one random standard board. Do not also supply `BOARD`. |
+| `--bulk beginner\|intermediate\|expert COUNT` | Generate and optimally solve `COUNT` boards, writing `board,3bv,optimal_clicks` CSV to standard output. |
+| `--seed N` | Reproduce a generated board or complete bulk sequence. Requires `--generate` or `--bulk`. |
 | `--format auto\|grid\|llamasweeper\|mbf` | Select the input parser. The default is `auto`. |
 | `--method frontier\|bruteforce` | Select the exact solver. The default is `frontier`; brute force is limited to 25 chord candidates. |
-| `--order auto\|rows\|columns` | Choose the frontier sweep direction. The default is `auto`. |
+| `--order auto\|rows\|columns\|rows-smart\|columns-smart` | Choose the frontier ordering. Smart orders optimize the order within each row or column; the default is `auto`. |
 | `--band-size N` | Set a band width of `N` rows or columns. With `--order auto`, compare both orientations. |
 | `--max-states N` | Stop if a pruned frontier layer exceeds `N` live states. The default is 2,000,000. |
 | `--progress` | Print frontier size and pruning progress to standard error. |
