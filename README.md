@@ -324,8 +324,11 @@ Candidates are processed in a spatial sweep. A boundary state records:
 - which active mine-flag and 3BV-coverage factors have already been hit.
 
 Equivalent histories are merged. Connectivity signatures are interned per
-layer, small bitsets are stored inline, and DP states are held in a dense
-open-addressed table.
+layer, and DP states are held in a dense open-addressed table. Mine/3BV factors
+receive reusable slots for only the portion of the sweep in which they are
+live. When at most 64 slots are required, the complete factor state is stored
+and processed as one `uint64_t`; wider custom boards use a dynamically sized
+bitset fallback.
 
 The solver also applies exact dominance pruning:
 
@@ -366,22 +369,21 @@ A conservative state bound is:
 S <= min(2^q, Bell(b + 1) * 2^f)
 ```
 
-For a somewhat more implementation-specific view, let `F` be the total number
-of mine/3BV factors, `R` the maximum number of distinct connectivity signatures
-in a layer, `c <= b` the maximum number of unfinished components, `D` the
-dominance-comparison limit, and `w = 64` the bitset word size. The main state
-storage is approximately
+For a somewhat more implementation-specific view, let `R` be the maximum
+number of distinct connectivity signatures in a layer, `c <= b` the maximum
+number of unfinished components, `D` the internal dominance-comparison limit,
+and `w = 64` the bitset word size. The main state storage is approximately
 
 ```text
-O(S * (ceil(F/w) + ceil(q/w)) + R * c * ceil(q/w)).
+O(S * (ceil(f/w) + ceil(q/w)) + R * c * ceil(q/w)).
 ```
 
 A conservative time bound for all `q` layers includes
 
 ```text
-O(q * (S*(F+q)/w
+O(q * (S*(f+q)/w
        + R*c*log(c)*q/w
-       + D*F/w
+       + D*f/w
        + R^2*(c^2*q/w + c^3))).
 ```
 

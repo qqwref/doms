@@ -944,6 +944,37 @@ static int bit_count_new_and(const Bits& member, const Bits& old, const Bits& fi
     return count;
 }
 
+template <typename FactorBits>
+struct FactorOps;
+
+template <>
+struct FactorOps<Bits> {
+    static Bits zero(size_t words) { return Bits(words); }
+    static void set(Bits& bits, int position) { set_bit(bits, position); }
+    static int count(const Bits& bits) { return bit_count(bits); }
+    static int count_new_and(const Bits& member, const Bits& old, const Bits& filter) {
+        return bit_count_new_and(member, old, filter);
+    }
+    static void add(Bits& target, const Bits& member) {
+        for (size_t word = 0; word < target.size(); ++word) target[word] |= member[word];
+    }
+    static void retain(Bits& target, const Bits& active) {
+        for (size_t word = 0; word < target.size(); ++word) target[word] &= active[word];
+    }
+};
+
+template <>
+struct FactorOps<uint64_t> {
+    static uint64_t zero(size_t) { return 0; }
+    static void set(uint64_t& bits, int position) { bits |= uint64_t{1} << position; }
+    static int count(uint64_t bits) { return __builtin_popcountll(bits); }
+    static int count_new_and(uint64_t member, uint64_t old, uint64_t filter) {
+        return __builtin_popcountll(member & ~old & filter);
+    }
+    static void add(uint64_t& target, uint64_t member) { target |= member; }
+    static void retain(uint64_t& target, uint64_t active) { target &= active; }
+};
+
 // Test whether the candidate's worst extra cost relative to the other state
 // fits within allowance. In "good-bit" form, flag hits and unhit base factors
 // are both desirable, and the penalty is simply good(other) & ~good(candidate).
@@ -958,6 +989,27 @@ static bool dominance_penalty_at_most(const Bits& candidate, const Bits& other,
         if (penalty > allowance) return false;
     }
     return true;
+}
+
+static bool dominance_penalty_at_most(uint64_t candidate, uint64_t other,
+                                      uint64_t base_mask, int allowance) {
+    const uint64_t candidate_good = candidate ^ base_mask;
+    const uint64_t other_good = other ^ base_mask;
+    return __builtin_popcountll(other_good & ~candidate_good) <= allowance;
+}
+
+static std::pair<int, int> factor_hit_counts(const Bits& hits, const Bits& base_mask) {
+    int base_hits = 0;
+    int total_hits = 0;
+    for (size_t word = 0; word < hits.size(); ++word) {
+        base_hits += __builtin_popcountll(hits[word] & base_mask[word]);
+        total_hits += __builtin_popcountll(hits[word]);
+    }
+    return {base_hits, total_hits};
+}
+
+static std::pair<int, int> factor_hit_counts(uint64_t hits, uint64_t base_mask) {
+    return {__builtin_popcountll(hits & base_mask), __builtin_popcountll(hits)};
 }
 
 static size_t hash_combine(size_t seed, uint64_t value) {
@@ -1015,19 +1067,29 @@ private:
     std::vector<const std::vector<uint64_t>*> by_id_;
 };
 
-struct State {
+template <typename FactorBits>
+struct FactorState {
     uint32_t connectivity_id = 0;
-    Bits hits;
-    bool operator==(const State& other) const {
+    FactorBits hits;
+    bool operator==(const FactorState& other) const {
         return connectivity_id == other.connectivity_id && hits == other.hits;
     }
 };
 
-struct StateHash {
-    size_t operator()(const State& state) const {
+static size_t append_factor_hash(size_t hash, const Bits& bits) {
+    for (size_t i = 0; i < bits.size(); ++i) hash = hash_combine(hash, bits[i]);
+    return hash;
+}
+
+static size_t append_factor_hash(size_t hash, uint64_t bits) {
+    return hash_combine(hash, bits);
+}
+
+template <typename FactorBits>
+struct FactorStateHash {
+    size_t operator()(const FactorState<FactorBits>& state) const {
         size_t hash = hash_combine(0, state.connectivity_id);
-        for (size_t i = 0; i < state.hits.size(); ++i) hash = hash_combine(hash, state.hits[i]);
-        return hash;
+        return append_factor_hash(hash, state.hits);
     }
 };
 
@@ -1036,18 +1098,27 @@ struct Record {
     Bits chosen;
 };
 
+static void release_factor_storage(Bits& bits) {
+    if (bits.size() > Bits::INLINE_WORDS) bits = Bits{};
+}
+
+static void release_factor_storage(uint64_t&) {}
+
 // The DP creates a fresh table for each layer, fills it, then only erases from
 // it during dominance pruning. Store values densely and keep a compact open-
 // addressed index alongside them. This avoids one allocation and one pointer
 // chase per state while preserving stable dense-entry indexes during pruning.
-class Table {
+template <typename FactorBits>
+class FactorTable {
 public:
+    using State = FactorState<FactorBits>;
+    using StateHash = FactorStateHash<FactorBits>;
     using value_type = std::pair<State, Record>;
 
     class iterator {
     public:
         using iterator_category = std::forward_iterator_tag;
-        using value_type = Table::value_type;
+        using value_type = FactorTable::value_type;
         using difference_type = std::ptrdiff_t;
         using pointer = value_type*;
         using reference = value_type&;
@@ -1071,22 +1142,22 @@ public:
         bool operator!=(const iterator& other) const { return !(*this == other); }
 
     private:
-        friend class Table;
-        iterator(Table* owner, size_t index) : owner_(owner), index_(index) { skip_dead(); }
+        friend class FactorTable;
+        iterator(FactorTable* owner, size_t index) : owner_(owner), index_(index) { skip_dead(); }
         void skip_dead() {
             if (owner_ == nullptr) return;
             while (index_ < owner_->entries_.size() && !owner_->alive_[index_]) ++index_;
         }
 
-        Table* owner_ = nullptr;
+        FactorTable* owner_ = nullptr;
         size_t index_ = 0;
     };
 
-    Table() = default;
-    Table(Table&&) noexcept = default;
-    Table& operator=(Table&&) noexcept = default;
-    Table(const Table&) = delete;
-    Table& operator=(const Table&) = delete;
+    FactorTable() = default;
+    FactorTable(FactorTable&&) noexcept = default;
+    FactorTable& operator=(FactorTable&&) noexcept = default;
+    FactorTable(const FactorTable&) = delete;
+    FactorTable& operator=(const FactorTable&) = delete;
 
     size_t size() const { return live_size_; }
     bool empty() const { return live_size_ == 0; }
@@ -1174,9 +1245,7 @@ public:
                 --live_size_;
                 // Inline words occupy the dense slot regardless, but release
                 // any wide-board overflow allocations immediately.
-                if (entries_[entry_index].first.hits.size() > Bits::INLINE_WORDS) {
-                    entries_[entry_index].first.hits = Bits{};
-                }
+                release_factor_storage(entries_[entry_index].first.hits);
                 if (entries_[entry_index].second.chosen.size() > Bits::INLINE_WORDS) {
                     entries_[entry_index].second.chosen = Bits{};
                 }
@@ -1187,7 +1256,7 @@ public:
         throw std::logic_error("flat DP table lost an indexed state");
     }
 
-    void swap(Table& other) noexcept {
+    void swap(FactorTable& other) noexcept {
         entries_.swap(other.entries_);
         alive_.swap(other.alive_);
         slots_.swap(other.slots_);
@@ -1344,13 +1413,14 @@ static bool connectivity_coarsens(const std::vector<uint64_t>& coarse,
     return true;
 }
 
-static size_t prune_dominated(Table& table,
+template <typename FactorBits>
+static size_t prune_dominated(FactorTable<FactorBits>& table,
                               uint64_t comparison_limit,
-                              const Bits& base_mask,
+                              const FactorBits& base_mask,
                               const ConnectivityPool& connectivity_pool,
                               size_t signature_words) {
     if (comparison_limit == 0 || table.size() < 2) return 0;
-    using Item = Table::iterator;
+    using Item = typename FactorTable<FactorBits>::iterator;
     struct CachedItem {
         Item item;
         DominanceKey key;
@@ -1405,13 +1475,8 @@ static size_t prune_dominated(Table& table,
     }
     for (auto item = table.begin(); item != table.end(); ++item) {
         const size_t bucket = connectivity_bucket[item->first.connectivity_id];
-        int base_hits = 0;
-        int total_hits = 0;
-        for (size_t word = 0; word < item->first.hits.size(); ++word) {
-            const uint64_t hits = item->first.hits[word];
-            base_hits += __builtin_popcountll(hits & base_mask[word]);
-            total_hits += __builtin_popcountll(hits);
-        }
+        const auto [base_hits, total_hits] =
+            factor_hit_counts(item->first.hits, base_mask);
         const int flag_hits = total_hits - base_hits;
         const DominanceKey key{
             item->second.cost + base_hits, item->second.cost, -total_hits};
@@ -1615,42 +1680,88 @@ static std::string comma_number(uint64_t value) {
 static Solution construct_solution(const Model& model, const std::vector<int>& selected,
                                    std::optional<int> expected_clicks = std::nullopt);
 
-static Solution solve_frontier(const Model& original_model,
-                               const std::string& requested_order,
-                               std::optional<int> band_size,
-                               bool progress) {
-    auto [model, order_name] = choose_order(original_model, requested_order, band_size);
-    const int q = static_cast<int>(model.candidates.size());
-
+struct FactorPlan {
     std::vector<std::vector<int>> scopes;
     std::vector<uint8_t> is_flag;
+    std::vector<int> first;
+    std::vector<int> last;
+    std::vector<int> slot;
+    int slot_count = 0;
+};
+
+static FactorPlan make_factor_plan(const Model& model) {
+    FactorPlan plan;
     auto add_scopes = [&](const std::vector<std::vector<int>>& source, bool flag) {
         for (const auto& scope : source) {
             if (scope.empty()) continue;
-            scopes.push_back(scope);
-            is_flag.push_back(flag);
+            plan.scopes.push_back(scope);
+            plan.is_flag.push_back(flag);
         }
     };
     add_scopes(model.mine_scopes, true);
     add_scopes(model.base_scopes, false);
-    const size_t factor_words = (scopes.size() + 63) / 64;
+    const int factor_count = static_cast<int>(plan.scopes.size());
+    plan.first.resize(factor_count);
+    plan.last.resize(factor_count);
+    plan.slot.resize(factor_count);
+    std::vector<int> order(factor_count);
+    std::iota(order.begin(), order.end(), 0);
+    for (int f = 0; f < factor_count; ++f) {
+        plan.first[f] = plan.scopes[f].front();
+        plan.last[f] = plan.scopes[f].back();
+    }
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return std::tuple<int, int, int>{plan.first[a], plan.last[a], a} <
+               std::tuple<int, int, int>{plan.first[b], plan.last[b], b};
+    });
+    std::vector<int> slot_last;
+    for (int f : order) {
+        int chosen = -1;
+        for (int slot = 0; slot < static_cast<int>(slot_last.size()); ++slot) {
+            if (slot_last[slot] < plan.first[f]) {
+                chosen = slot;
+                break;
+            }
+        }
+        if (chosen < 0) {
+            chosen = static_cast<int>(slot_last.size());
+            slot_last.push_back(plan.last[f]);
+        } else {
+            slot_last[chosen] = plan.last[f];
+        }
+        plan.slot[f] = chosen;
+    }
+    plan.slot_count = static_cast<int>(slot_last.size());
+    return plan;
+}
+
+template <typename FactorBits>
+static Solution solve_frontier_core(const Model& original_model,
+                                    const Model& model,
+                                    const std::string& order_name,
+                                    const FactorPlan& factors,
+                                    bool progress) {
+    using Ops = FactorOps<FactorBits>;
+    using StateType = FactorState<FactorBits>;
+    using TableType = FactorTable<FactorBits>;
+    const int q = static_cast<int>(model.candidates.size());
+    const size_t factor_words = (factors.slot_count + 63) / 64;
     const size_t chosen_words = (q + 63) / 64;
-    Bits flag_mask(factor_words), base_mask(factor_words);
-    for (int f = 0; f < static_cast<int>(scopes.size()); ++f) {
-        set_bit(is_flag[f] ? flag_mask : base_mask, f);
-    }
-    std::vector<Bits> factor_member(q, Bits(factor_words));
-    std::vector<int> factor_min(scopes.size());
-    std::vector<int> factor_max(scopes.size());
-    for (int f = 0; f < static_cast<int>(scopes.size()); ++f) {
-        factor_min[f] = scopes[f].front();
-        factor_max[f] = scopes[f].back();
-        for (int variable : scopes[f]) set_bit(factor_member[variable], f);
-    }
-    std::vector<Bits> active_after(q, Bits(factor_words));
-    for (int i = 0; i < q; ++i) {
-        for (int f = 0; f < static_cast<int>(scopes.size()); ++f) {
-            if (factor_min[f] <= i && i < factor_max[f]) set_bit(active_after[i], f);
+    const FactorBits zero_factors = Ops::zero(factor_words);
+    std::vector<FactorBits> factor_member(q, zero_factors);
+    std::vector<FactorBits> flag_member(q, zero_factors);
+    std::vector<FactorBits> base_member(q, zero_factors);
+    std::vector<FactorBits> active_after(q, zero_factors);
+    std::vector<FactorBits> base_after(q, zero_factors);
+    for (int f = 0; f < static_cast<int>(factors.scopes.size()); ++f) {
+        const int slot = factors.slot[f];
+        for (int variable : factors.scopes[f]) {
+            Ops::set(factor_member[variable], slot);
+            Ops::set(factors.is_flag[f] ? flag_member[variable] : base_member[variable], slot);
+        }
+        for (int i = factors.first[f]; i < factors.last[f]; ++i) {
+            Ops::set(active_after[i], slot);
+            if (!factors.is_flag[f]) Ops::set(base_after[i], slot);
         }
     }
 
@@ -1691,9 +1802,9 @@ static Solution solve_frontier(const Model& original_model,
     }
     const auto region_ranks = progress ? ordered_region_ranks(model, order_name) : std::vector<int>{};
 
-    Table table;
+    TableType table;
     table.reserve(16);
-    table.emplace(State{0, Bits(factor_words)}, Record{model.three_bv(), Bits(chosen_words)});
+    table.emplace(StateType{0, zero_factors}, Record{model.three_bv(), Bits(chosen_words)});
     ConnectivityPool connectivity_pool;
     ConnectivityPool next_connectivity_pool;
     size_t peak_states = 1;
@@ -1704,7 +1815,7 @@ static Solution solve_frontier(const Model& original_model,
     for (int i = 0; i < q; ++i) {
         const auto& new_boundary = boundaries[i + 1];
 
-        Table next;
+        TableType next;
         const size_t desired_capacity = table.size() > (std::numeric_limits<size_t>::max() - 16) / 2
             ? std::numeric_limits<size_t>::max() : table.size() * 2 + 16;
         next.reserve(desired_capacity);
@@ -1803,22 +1914,20 @@ static Solution solve_frontier(const Model& original_model,
                 }
 
                 for (int selected = 0; selected <= 1; ++selected) {
-                    Bits new_hits = old_state.hits;
+                    FactorBits new_hits = old_state.hits;
                     int factor_cost = 0;
                     if (selected) {
-                        factor_cost += bit_count_new_and(factor_member[i], old_state.hits, flag_mask);
-                        factor_cost -= bit_count_new_and(factor_member[i], old_state.hits, base_mask);
-                        for (size_t word = 0; word < factor_words; ++word) {
-                            new_hits[word] |= factor_member[i][word];
-                        }
+                        factor_cost += Ops::count_new_and(
+                            factor_member[i], old_state.hits, flag_member[i]);
+                        factor_cost -= Ops::count_new_and(
+                            factor_member[i], old_state.hits, base_member[i]);
+                        Ops::add(new_hits, factor_member[i]);
                     }
-                    for (size_t word = 0; word < factor_words; ++word) {
-                        new_hits[word] &= active_after[i][word];
-                    }
+                    Ops::retain(new_hits, active_after[i]);
                     const auto& connection =
                         connectivity_cache[old_state.connectivity_id][selected];
                     const int new_cost = old_record.cost + selected + connection.closed + factor_cost;
-                    State state{connection.connectivity_id, std::move(new_hits)};
+                    StateType state{connection.connectivity_id, std::move(new_hits)};
                     auto found = next.find(state);
                     if (found == next.end()) {
                         Bits new_chosen = old_record.chosen;
@@ -1837,7 +1946,7 @@ static Solution solve_frontier(const Model& original_model,
         // them before dominance pruning so they do not overlap the largest
         // temporary structures of the new layer.
         {
-            Table released;
+            TableType released;
             table.swap(released);
         }
         {
@@ -1846,14 +1955,14 @@ static Solution solve_frontier(const Model& original_model,
         }
 
         const size_t removed = prune_dominated(
-            next, DOMINANCE_COMPARISONS, base_mask,
+            next, DOMINANCE_COMPARISONS, base_after[i],
             next_connectivity_pool, chosen_words);
         table = std::move(next);
         connectivity_pool.swap(next_connectivity_pool);
         dominated_total += removed;
         peak_states = std::max(peak_states, table.size());
         max_boundary = std::max(max_boundary, static_cast<int>(new_boundary.size()));
-        const int active_count = bit_count(active_after[i]);
+        const int active_count = Ops::count(active_after[i]);
         max_active = std::max(max_active, active_count);
         if (progress && ((i + 1) % PROGRESS_INTERVAL == 0 || i + 1 == q)) {
             std::cerr << "DP: region contains " << region_ranks[i] << "/"
@@ -1865,7 +1974,7 @@ static Solution solve_frontier(const Model& original_model,
         }
     }
 
-    State final_state{0, Bits(factor_words)};
+    StateType final_state{0, zero_factors};
     auto final = table.find(final_state);
     if (final == table.end()) throw std::logic_error("frontier DP did not reach an empty final state");
     std::vector<int> selected;
@@ -1882,6 +1991,20 @@ static Solution solve_frontier(const Model& original_model,
     solution.max_active_factors = max_active;
     solution.order_name = order_name;
     return solution;
+}
+
+static Solution solve_frontier(const Model& original_model,
+                               const std::string& requested_order,
+                               std::optional<int> band_size,
+                               bool progress) {
+    auto [model, order_name] = choose_order(original_model, requested_order, band_size);
+    const FactorPlan factors = make_factor_plan(model);
+    if (factors.slot_count <= 64) {
+        return solve_frontier_core<uint64_t>(
+            original_model, model, order_name, factors, progress);
+    }
+    return solve_frontier_core<Bits>(
+        original_model, model, order_name, factors, progress);
 }
 
 struct Evaluation {
