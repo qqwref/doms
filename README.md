@@ -15,8 +15,8 @@ The program optimizes the complete click sequence, including:
 - ordinary left-clicks needed for 3BV openings not reached by a chord.
 
 It outputs both the optimal number of clicks and a valid sequence of actions
-that achieves it. The solver is exact: dominance pruning and its configurable
-comparison limit affect performance, not the correctness of the result.
+that achieves it. The solver is exact: dominance pruning affects performance,
+not the correctness of the result.
 
 The implementation is a standalone C++17 program with no third-party
 dependencies.
@@ -76,13 +76,13 @@ as a special character when it is not quoted.
 For ordinary human-readable output:
 
 ```console
-./doms board.txt
+./doms example.mbf
 ```
 
 For machine-readable output:
 
 ```console
-./doms board.txt --json > solution.json
+./doms example.mbf --json > solution.json
 ```
 
 The solution is written to standard output. Timing, progress, and generated
@@ -91,28 +91,8 @@ or click-tuple output.
 
 ## Input formats
 
-The input format is normally detected automatically. Use `--format` to force a
-particular parser if necessary.
-
-### Text grid
-
-A text grid uses `*` or `M` for a mine and `.` for a safe square:
-
-```text
-*...
-....
-..*.
-....
-```
-
-Whitespace is ignored. Lines beginning with `;` are treated as comments.
-Digits `0` through `8` are accepted as safe cells, but their values are ignored
-and recalculated from the mine positions.
-
-```console
-./doms board.txt
-./doms board.txt --format grid
-```
+The program automatically distinguishes PTTACG input from MBF input. Text-grid
+input is not supported.
 
 ### PTTACG string or compatible LlamaSweeper URL
 
@@ -129,9 +109,6 @@ This board-string format was created by
 ([source code](https://github.com/PTTACGfans/Minesweeper-ZiNi-Calculator)).
 LlamaSweeper supports the format but did not originate it. This README refers
 to these encodings as **PTTACG strings**.
-
-For command-line compatibility, the forced parser name remains
-`--format llamasweeper`.
 
 The standard board codes are:
 
@@ -219,7 +196,7 @@ Bulk generation uses `std::mt19937_64` and unbiased rejection sampling. Supply
 
 ## Output formats and coordinates
 
-Coordinates are 1-based by default. Add `--zero-based` for 0-based coordinates.
+All output coordinates are 1-based.
 
 The normal action listing uses `(row, column)`. JSON coordinate arrays and the
 named fields in `actions` also use row before column. Click tuples use
@@ -240,7 +217,7 @@ Elapsed solve time is always printed to standard error.
 ### Click tuples
 
 ```console
-./doms board.txt --click-tuples
+./doms example.mbf --click-tuples
 ```
 
 This prints a list of:
@@ -256,7 +233,7 @@ This prints a list of:
 ### JSON
 
 ```console
-./doms board.txt --json
+./doms example.mbf --json
 ```
 
 JSON output includes:
@@ -275,7 +252,7 @@ JSON output includes:
 ```text
 Usage: doms [BOARD] [options]
 
-BOARD may be a grid filename, PTTACG string or compatible LlamaSweeper URL,
+BOARD may be a PTTACG string or compatible LlamaSweeper URL,
 MBF filename, or quoted MBF hexadecimal.
 ```
 
@@ -284,18 +261,11 @@ MBF filename, or quoted MBF hexadecimal.
 | `--generate beginner\|intermediate\|expert` | Generate, print, and solve one random standard board. Do not also supply `BOARD`. |
 | `--bulk beginner\|intermediate\|expert COUNT` | Generate and optimally solve `COUNT` boards, writing `board,3bv,optimal_clicks` CSV to standard output. |
 | `--seed N` | Reproduce a generated board or complete bulk sequence. Requires `--generate` or `--bulk`. |
-| `--format auto\|grid\|llamasweeper\|mbf` | Select the input parser. The default is `auto`. |
-| `--method frontier\|bruteforce` | Select the exact solver. The default is `frontier`; brute force is limited to 25 chord candidates. |
 | `--order auto\|rows\|columns\|rows-smart\|columns-smart` | Choose the frontier ordering. Smart orders optimize the order within each row or column; the default is `auto`. |
 | `--band-size N` | Set a band width of `N` rows or columns. With `--order auto`, compare both orientations. |
-| `--max-states N` | Stop if a pruned frontier layer exceeds `N` live states. The default is 2,000,000. |
 | `--progress` | Print frontier size and pruning progress to standard error. |
-| `--progress-every N` | Print progress after every `N` chord candidates. The default is 10. |
-| `--dominance-comparisons N` | Limit dominance comparisons per layer. The default is 1,000,000; `0` disables dominance pruning. |
-| `--verify` | On boards with at most 25 chord candidates, compare the frontier result with exhaustive brute force. |
 | `--json` | Print machine-readable JSON. |
 | `--click-tuples` | Print only `(click_type, x, y)` tuples. |
-| `--zero-based` | Use coordinates beginning at zero instead of one. |
 | `-h`, `--help` | Display command-line help. |
 
 The program exits with status `0` on success and `2` after an input, resource,
@@ -306,39 +276,20 @@ or validation error.
 Show live frontier statistics while solving:
 
 ```console
-./doms board.txt --progress --progress-every 5
+./doms example.mbf --progress
 ```
 
 Force a particular sweep direction:
 
 ```console
-./doms board.txt --order rows
-./doms board.txt --order columns
+./doms example.mbf --order rows
+./doms example.mbf --order columns
 ```
 
 Try wider frontier bands:
 
 ```console
-./doms board.txt --band-size 2
-```
-
-Increase the live-state limit when sufficient memory is available:
-
-```console
-./doms board.txt --max-states 5000000
-```
-
-Disable dominance pruning for comparison:
-
-```console
-./doms board.txt --dominance-comparisons 0
-```
-
-Exhaustively verify a small board:
-
-```console
-./doms small-board.txt --verify
-./doms small-board.txt --method bruteforce
+./doms example.mbf --band-size 2
 ```
 
 ## What is being optimized?
@@ -440,13 +391,12 @@ signature pairs without running the full matching test. Actual performance
 depends heavily on the board, processing order, state merging, and dominance
 pruning.
 
-Some unusually connected boards can still exceed the default state limit or
-take a long time. Useful responses are:
+Some unusually connected boards can still use a large amount of memory or take
+a long time. Useful responses are:
 
 1. Enable `--progress` to identify where the frontier grows.
 2. Try `--order rows` and `--order columns` explicitly.
 3. Experiment with a small `--band-size`.
-4. Raise `--max-states` only when sufficient memory is available.
 
 The solver assumes that all mine locations are already known and that flags may
 be placed before their neighboring numbered squares are opened. It is not a
@@ -466,5 +416,5 @@ Compile with AddressSanitizer and UndefinedBehaviorSanitizer:
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer minesweeper_chord_dp.cpp -o doms_san
 ```
 
-Then use `--verify` on small boards to compare the frontier DP against exhaustive
-enumeration.
+Run representative PTTACG and MBF boards through both builds and compare their
+optimal click counts and action sequences.

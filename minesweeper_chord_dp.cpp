@@ -33,12 +33,10 @@
 namespace fs = std::filesystem;
 
 constexpr std::string_view LLAMA_ALPHABET = "0123456789abcdefghijklmnopqrstuv";
+constexpr int PROGRESS_INTERVAL = 10;
+constexpr uint64_t DOMINANCE_COMPARISONS = 1'000'000;
 
 struct UserError : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
-
-struct StateLimitExceeded : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
@@ -122,40 +120,6 @@ static std::string lower_copy(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     return value;
-}
-
-static Board parse_grid(const std::string& text) {
-    std::istringstream input(text);
-    std::vector<std::string> rows;
-    std::string raw;
-    while (std::getline(input, raw)) {
-        std::string line;
-        for (unsigned char ch : raw) {
-            if (!std::isspace(ch)) line.push_back(static_cast<char>(ch));
-        }
-        if (line.empty() || line.front() == ';') continue;
-        rows.push_back(std::move(line));
-    }
-    if (rows.empty()) throw UserError("the board is empty");
-    const int width = static_cast<int>(rows.front().size());
-    for (const auto& row : rows) {
-        if (static_cast<int>(row.size()) != width) {
-            throw UserError("all board rows must have the same width");
-        }
-    }
-    Board board{static_cast<int>(rows.size()), width,
-                std::vector<uint8_t>(rows.size() * width, 0)};
-    for (int r = 0; r < board.height; ++r) {
-        for (int c = 0; c < width; ++c) {
-            const char ch = rows[r][c];
-            if (ch == '*' || ch == 'M') {
-                board.mines[r * width + c] = 1;
-            } else if (ch != '.' && !(ch >= '0' && ch <= '8')) {
-                throw UserError(std::string("unsupported board character: '") + ch + "'");
-            }
-        }
-    }
-    return board;
 }
 
 static std::pair<std::string, std::string> llama_parameters(std::string source) {
@@ -348,26 +312,22 @@ static std::string read_file_text(const fs::path& path) {
     return std::string(std::istreambuf_iterator<char>(input), {});
 }
 
-static Board load_board(const std::string& source, const std::string& format) {
+static Board load_board(const std::string& source) {
     std::error_code ec;
     const fs::path path(source);
     const bool is_file = fs::is_regular_file(path, ec);
     std::string raw = is_file ? read_file_text(path) : source;
-    const bool mbf_file = is_file && lower_copy(path.extension().string()) == ".mbf";
-    if (format == "mbf" || (format == "auto" && mbf_file)) {
-        if (looks_like_mbf_hex(raw)) return parse_mbf_bytes(mbf_hex_bytes(raw));
-        return parse_mbf_bytes(std::vector<uint8_t>(raw.begin(), raw.end()));
-    }
-    if (format == "grid") return parse_grid(raw);
-    if (format == "llamasweeper") return parse_llamasweeper(raw);
-    if (format != "auto") throw UserError("unknown input format '" + format + "'");
     const std::string lowered = lower_copy(raw);
     if (lowered.find("llamasweeper.com") != std::string::npos ||
         (raw.find("b=") != std::string::npos && raw.find("m=") != std::string::npos)) {
         return parse_llamasweeper(raw);
     }
     if (looks_like_mbf_hex(raw)) return parse_mbf_bytes(mbf_hex_bytes(raw));
-    return parse_grid(raw);
+    if (is_file) {
+        return parse_mbf_bytes(std::vector<uint8_t>(raw.begin(), raw.end()));
+    }
+    throw UserError("input must be a PTTACG string or compatible LlamaSweeper URL, "
+                    "an MBF file, or quoted MBF hexadecimal");
 }
 
 static std::tuple<int, int, int> standard_board_spec(const std::string& difficulty) {
@@ -1657,11 +1617,8 @@ static Solution construct_solution(const Model& model, const std::vector<int>& s
 
 static Solution solve_frontier(const Model& original_model,
                                const std::string& requested_order,
-                               size_t max_states,
                                std::optional<int> band_size,
-                               bool progress,
-                               int progress_every,
-                               uint64_t dominance_comparisons) {
+                               bool progress) {
     auto [model, order_name] = choose_order(original_model, requested_order, band_size);
     const int q = static_cast<int>(model.candidates.size());
 
@@ -1732,7 +1689,6 @@ static Solution solve_frontier(const Model& original_model,
             }
         }
     }
-    if (progress_every < 1) throw UserError("progress interval must be positive");
     const auto region_ranks = progress ? ordered_region_ranks(model, order_name) : std::vector<int>{};
 
     Table table;
@@ -1751,9 +1707,7 @@ static Solution solve_frontier(const Model& original_model,
         Table next;
         const size_t desired_capacity = table.size() > (std::numeric_limits<size_t>::max() - 16) / 2
             ? std::numeric_limits<size_t>::max() : table.size() * 2 + 16;
-        const size_t state_capacity = max_states == std::numeric_limits<size_t>::max()
-            ? desired_capacity : std::min(max_states + 1, desired_capacity);
-        next.reserve(state_capacity);
+        next.reserve(desired_capacity);
         next_connectivity_pool.reset(connectivity_pool.size() * 2 + 16);
         {
             std::vector<std::array<ConnectivityTransition, 2>> connectivity_cache(
@@ -1892,7 +1846,7 @@ static Solution solve_frontier(const Model& original_model,
         }
 
         const size_t removed = prune_dominated(
-            next, dominance_comparisons, base_mask,
+            next, DOMINANCE_COMPARISONS, base_mask,
             next_connectivity_pool, chosen_words);
         table = std::move(next);
         connectivity_pool.swap(next_connectivity_pool);
@@ -1901,18 +1855,13 @@ static Solution solve_frontier(const Model& original_model,
         max_boundary = std::max(max_boundary, static_cast<int>(new_boundary.size()));
         const int active_count = bit_count(active_after[i]);
         max_active = std::max(max_active, active_count);
-        if (progress && ((i + 1) % progress_every == 0 || i + 1 == q)) {
+        if (progress && ((i + 1) % PROGRESS_INTERVAL == 0 || i + 1 == q)) {
             std::cerr << "DP: region contains " << region_ranks[i] << "/"
                       << model.height * model.width << " tiles; processed " << i + 1
                       << "/" << q << " chord candidates; " << comma_number(table.size())
                       << " valid boundary states; boundary " << new_boundary.size()
                       << " connectivity items + " << active_count << " factor bits; pruned "
                       << comma_number(dominated_total) << " dominated states\n";
-        }
-        if (table.size() > max_states) {
-            throw StateLimitExceeded("frontier grew to " + comma_number(table.size()) +
-                                     " states after variable " + std::to_string(i + 1) + "/" +
-                                     std::to_string(q) + "; increase --max-states or try the other --order");
         }
     }
 
@@ -2126,29 +2075,6 @@ static Solution construct_solution(const Model& model, const std::vector<int>& s
     return solution;
 }
 
-static Solution solve_bruteforce(const Model& model, int max_candidates = 25) {
-    const int q = static_cast<int>(model.candidates.size());
-    if (q > max_candidates) {
-        throw UserError("brute force is limited to " + std::to_string(max_candidates) +
-                        " candidates; board has " + std::to_string(q));
-    }
-    int best_cost = std::numeric_limits<int>::max();
-    std::vector<int> best;
-    const uint64_t limit = uint64_t{1} << q;
-    for (uint64_t mask = 0; mask < limit; ++mask) {
-        std::vector<int> selected;
-        for (int i = 0; i < q; ++i) if ((mask >> i) & 1U) selected.push_back(i);
-        const int cost = evaluate_set(model, selected).clicks;
-        if (cost < best_cost) {
-            best_cost = cost;
-            best = std::move(selected);
-        }
-    }
-    Solution solution = construct_solution(model, best, best_cost);
-    solution.order_name = "brute-force";
-    return solution;
-}
-
 static std::string action_word(ActionType type) {
     if (type == ActionType::Flag) return "flag";
     if (type == ActionType::Left) return "left";
@@ -2178,11 +2104,11 @@ static std::string json_escape(const std::string& text) {
     return out.str();
 }
 
-static void print_coord_json(std::ostream& out, int cell, const Model& model, int offset) {
-    out << '[' << cell / model.width + offset << ',' << cell % model.width + offset << ']';
+static void print_coord_json(std::ostream& out, int cell, const Model& model) {
+    out << '[' << cell / model.width + 1 << ',' << cell % model.width + 1 << ']';
 }
 
-static void print_json(const Model& model, const Solution& solution, int offset,
+static void print_json(const Model& model, const Solution& solution,
                        const std::optional<std::string>& generated_difficulty,
                        const std::optional<uint64_t>& generated_seed,
                        const std::optional<std::string>& generated_url) {
@@ -2192,7 +2118,7 @@ static void print_json(const Model& model, const Solution& solution, int offset,
         std::cout << '[';
         for (size_t i = 0; i < candidates.size(); ++i) {
             if (i) std::cout << ',';
-            print_coord_json(std::cout, model.candidates[candidates[i]], model, offset);
+            print_coord_json(std::cout, model.candidates[candidates[i]], model);
         }
         std::cout << ']';
     };
@@ -2200,7 +2126,7 @@ static void print_json(const Model& model, const Solution& solution, int offset,
     std::cout << "  \"flags\": [";
     for (size_t i = 0; i < solution.flags.size(); ++i) {
         if (i) std::cout << ',';
-        print_coord_json(std::cout, solution.flags[i], model, offset);
+        print_coord_json(std::cout, solution.flags[i], model);
     }
     std::cout << "],\n  \"chord_components\": [";
     for (size_t i = 0; i < solution.components.size(); ++i) {
@@ -2212,22 +2138,22 @@ static void print_json(const Model& model, const Solution& solution, int offset,
         if (i) std::cout << ',';
         print_coord_json(std::cout,
                          model.base_descriptions[solution.uncovered_units[i]].representative,
-                         model, offset);
+                         model);
     }
     std::cout << "],\n  \"actions\": [";
     for (size_t i = 0; i < solution.actions.size(); ++i) {
         if (i) std::cout << ',';
         const auto& action = solution.actions[i];
         std::cout << "{\"action\":\"" << action_word(action.type) << "\",\"row\":"
-                  << action.cell / model.width + offset << ",\"column\":"
-                  << action.cell % model.width + offset << '}';
+                  << action.cell / model.width + 1 << ",\"column\":"
+                  << action.cell % model.width + 1 << '}';
     }
     std::cout << "],\n  \"clicks\": [";
     for (size_t i = 0; i < solution.actions.size(); ++i) {
         if (i) std::cout << ',';
         const auto& action = solution.actions[i];
-        std::cout << "[\"" << click_word(action.type) << "\"," << action.cell % model.width + offset
-                  << ',' << action.cell / model.width + offset << ']';
+        std::cout << "[\"" << click_word(action.type) << "\"," << action.cell % model.width + 1
+                  << ',' << action.cell / model.width + 1 << ']';
     }
     std::cout << "],\n  \"statistics\": {"
               << "\"candidate_chords\":" << model.candidates.size()
@@ -2249,14 +2175,14 @@ static void print_json(const Model& model, const Solution& solution, int offset,
     std::cout << "\n}\n";
 }
 
-static void print_click_tuples(const Model& model, const Solution& solution, int offset) {
+static void print_click_tuples(const Model& model, const Solution& solution) {
     std::cout << '[';
     for (size_t i = 0; i < solution.actions.size(); ++i) {
         if (i) std::cout << ", ";
         const auto& action = solution.actions[i];
         std::cout << "('" << click_word(action.type) << "', "
-                  << action.cell % model.width + offset << ", "
-                  << action.cell / model.width + offset << ')';
+                  << action.cell % model.width + 1 << ", "
+                  << action.cell / model.width + 1 << ')';
     }
     std::cout << "]\n";
 }
@@ -2267,25 +2193,18 @@ struct Options {
     std::optional<std::string> bulk;
     size_t bulk_count = 0;
     std::optional<uint64_t> seed;
-    std::string format = "auto";
-    std::string method = "frontier";
     std::string order = "auto";
     std::optional<int> band_size;
-    size_t max_states = 2'000'000;
     bool progress = false;
-    int progress_every = 10;
-    uint64_t dominance_comparisons = 1'000'000;
-    bool verify = false;
     bool json = false;
     bool click_tuples = false;
-    bool zero_based = false;
 };
 
 static void print_help(const char* program) {
     std::cout
         << "Deterministically Optimal Minesweeper Solver (DOMS, C++17)\n\n"
         << "Usage: " << program << " [BOARD] [options]\n\n"
-        << "BOARD may be a grid filename, PTTACG string or compatible LlamaSweeper URL,\n"
+        << "BOARD may be a PTTACG string or compatible LlamaSweeper URL,\n"
         << "MBF filename, or quoted MBF hex.\n\n"
         << "Options:\n"
         << "  --generate beginner|intermediate|expert\n"
@@ -2293,17 +2212,11 @@ static void print_help(const char* program) {
         << "  --bulk beginner|intermediate|expert COUNT\n"
         << "                                 Generate and solve COUNT boards; write CSV\n"
         << "  --seed N                       Reproduce generated or bulk boards\n"
-        << "  --format auto|grid|llamasweeper|mbf\n"
-        << "  --method frontier|bruteforce\n"
         << "  --order auto|rows|columns|rows-smart|columns-smart\n"
         << "  --band-size N\n"
-        << "  --max-states N\n"
-        << "  --progress [--progress-every N]\n"
-        << "  --dominance-comparisons N\n"
-        << "  --verify\n"
+        << "  --progress\n"
         << "  --json\n"
         << "  --click-tuples\n"
-        << "  --zero-based\n"
         << "  -h, --help\n";
 }
 
@@ -2352,18 +2265,11 @@ static Options parse_options(int argc, char** argv) {
             options.bulk_count = parse_positive_size(value_after(i, arg), arg);
         }
         else if (arg == "--seed") options.seed = parse_u64(value_after(i, arg), arg);
-        else if (arg == "--format") options.format = value_after(i, arg);
-        else if (arg == "--method") options.method = value_after(i, arg);
         else if (arg == "--order") options.order = value_after(i, arg);
         else if (arg == "--band-size") options.band_size = parse_positive_int(value_after(i, arg), arg);
-        else if (arg == "--max-states") options.max_states = parse_u64(value_after(i, arg), arg);
         else if (arg == "--progress") options.progress = true;
-        else if (arg == "--progress-every") options.progress_every = parse_positive_int(value_after(i, arg), arg);
-        else if (arg == "--dominance-comparisons") options.dominance_comparisons = parse_u64(value_after(i, arg), arg);
-        else if (arg == "--verify") options.verify = true;
         else if (arg == "--json") options.json = true;
         else if (arg == "--click-tuples") options.click_tuples = true;
-        else if (arg == "--zero-based") options.zero_based = true;
         else if (!arg.empty() && arg.front() == '-') throw UserError("unknown option: " + arg);
         else if (options.board) throw UserError("only one board argument is allowed");
         else options.board = arg;
@@ -2380,7 +2286,6 @@ static Options parse_options(int argc, char** argv) {
             throw UserError("--bulk must be beginner, intermediate, or expert");
         }
         if (options.board) throw UserError("do not supply a board argument with --bulk");
-        if (options.format != "auto") throw UserError("--format cannot be used with --bulk");
         if (options.json || options.click_tuples) {
             throw UserError("--bulk already writes CSV; do not combine it with --json or --click-tuples");
         }
@@ -2389,17 +2294,9 @@ static Options parse_options(int argc, char** argv) {
             throw UserError("--generate must be beginner, intermediate, or expert");
         }
         if (options.board) throw UserError("do not supply a board argument with --generate");
-        if (options.format != "auto") throw UserError("--format cannot be used with --generate");
     } else {
         if (!options.board) throw UserError("a board argument, --generate, or --bulk is required");
         if (options.seed) throw UserError("--seed requires --generate or --bulk");
-    }
-    if (options.format != "auto" && options.format != "grid" &&
-        options.format != "llamasweeper" && options.format != "mbf") {
-        throw UserError("invalid --format value");
-    }
-    if (options.method != "frontier" && options.method != "bruteforce") {
-        throw UserError("invalid --method value");
     }
     if (options.order != "auto" && options.order != "rows" && options.order != "columns" &&
         options.order != "rows-smart" && options.order != "columns-smart") {
@@ -2427,20 +2324,8 @@ int main(int argc, char** argv) {
                 }
                 try {
                     Model model = build_model(board);
-                    Solution solution;
-                    if (options.method == "bruteforce") solution = solve_bruteforce(model);
-                    else {
-                        solution = solve_frontier(model, options.order, options.max_states,
-                                                  options.band_size, options.progress,
-                                                  options.progress_every,
-                                                  options.dominance_comparisons);
-                    }
-                    if (options.verify && model.candidates.size() <= 25) {
-                        const Solution brute = solve_bruteforce(model);
-                        if (brute.clicks != solution.clicks) {
-                            throw std::logic_error("frontier and brute-force results differ");
-                        }
-                    }
+                    Solution solution = solve_frontier(
+                        model, options.order, options.band_size, options.progress);
                     std::cout << '"' << encoded << "\"," << model.three_bv() << ','
                               << solution.clicks << '\n';
                 } catch (const std::exception& error) {
@@ -2467,35 +2352,24 @@ int main(int argc, char** argv) {
             std::cerr << "Generated board: " << *generated_url << "\n"
                       << "Random seed: " << seed << "\n";
         } else {
-            board = load_board(*options.board, options.format);
+            board = load_board(*options.board);
         }
 
         const auto start = std::chrono::steady_clock::now();
         Model model = build_model(board);
-        Solution solution;
-        if (options.method == "bruteforce") solution = solve_bruteforce(model);
-        else {
-            solution = solve_frontier(model, options.order, options.max_states,
-                                      options.band_size, options.progress,
-                                      options.progress_every,
-                                      options.dominance_comparisons);
-        }
+        Solution solution = solve_frontier(
+            model, options.order, options.band_size, options.progress);
         const auto end = std::chrono::steady_clock::now();
         solution.solve_seconds = std::chrono::duration<double>(end - start).count();
         std::cerr << "Solve time: " << std::fixed << std::setprecision(3)
                   << solution.solve_seconds << " seconds\n";
 
-        if (options.verify && model.candidates.size() <= 25) {
-            const Solution brute = solve_bruteforce(model);
-            if (brute.clicks != solution.clicks) throw std::logic_error("frontier and brute-force results differ");
-        }
-        const int offset = options.zero_based ? 0 : 1;
         if (options.click_tuples) {
-            print_click_tuples(model, solution, offset);
+            print_click_tuples(model, solution);
             return 0;
         }
         if (options.json) {
-            print_json(model, solution, offset, options.generate, generated_seed, generated_url);
+            print_json(model, solution, options.generate, generated_seed, generated_url);
             return 0;
         }
         std::cout << "Optimal clicks: " << solution.clicks << " (3BV without chording: "
@@ -2504,20 +2378,18 @@ int main(int argc, char** argv) {
                   << solution.components.size() << " seed left-clicks + "
                   << solution.selected.size() << " chords + "
                   << solution.uncovered_units.size() << " remaining 3BV clicks\n";
-        if (solution.order_name != "brute-force") {
-            std::cout << "DP: " << solution.order_name << " order, "
-                      << comma_number(solution.peak_states) << " peak states, boundary "
-                      << solution.max_boundary_vertices << " connectivity items + "
-                      << solution.max_active_factors << " factor bits\n";
-        }
+        std::cout << "DP: " << solution.order_name << " order, "
+                  << comma_number(solution.peak_states) << " peak states, boundary "
+                  << solution.max_boundary_vertices << " connectivity items + "
+                  << solution.max_active_factors << " factor bits\n";
         std::cout << "Actions:\n";
         for (size_t i = 0; i < solution.actions.size(); ++i) {
             const auto& action = solution.actions[i];
             const char* name = action.type == ActionType::Flag ? "FLAG " :
                                (action.type == ActionType::Left ? "LEFT " : "CHORD");
             std::cout << std::setw(4) << i + 1 << ". " << name << " ("
-                      << action.cell / model.width + offset << ','
-                      << action.cell % model.width + offset << ")\n";
+                      << action.cell / model.width + 1 << ','
+                      << action.cell % model.width + 1 << ")\n";
         }
         return 0;
     } catch (const std::exception& error) {
