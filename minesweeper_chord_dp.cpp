@@ -91,6 +91,7 @@ struct Solution {
     int candidate_chords_after_reduction = 0;
     int swap_dominated_chords = 0;
     int left_click_dominated_chords = 0;
+    size_t opening_chain_absorptions = 0;
     double reduction_seconds = 0.0;
     std::string order_name;
     double solve_seconds = 0.0;
@@ -1187,10 +1188,12 @@ static std::pair<Model, std::string> choose_order(const Model& model,
         }
     }
     auto best = std::min_element(choices.begin(), choices.end(), [](const auto& a, const auto& b) {
-        return std::tuple<int, uint64_t, std::string>{
-                   std::get<0>(a.estimate), std::get<3>(a.estimate), a.name} <
-               std::tuple<int, uint64_t, std::string>{
-                   std::get<0>(b.estimate), std::get<3>(b.estimate), b.name};
+        return std::tuple<int, int, uint64_t, std::string>{
+                   std::get<0>(a.estimate), std::get<1>(a.estimate),
+                   std::get<3>(a.estimate), a.name} <
+               std::tuple<int, int, uint64_t, std::string>{
+                   std::get<0>(b.estimate), std::get<1>(b.estimate),
+                   std::get<3>(b.estimate), b.name};
     });
     return {ordered_model(model, best->order), best->name};
 }
@@ -1275,6 +1278,10 @@ struct FactorOps<Bits> {
     static void retain(Bits& target, const Bits& active) {
         for (size_t word = 0; word < target.size(); ++word) target[word] &= active[word];
     }
+    static bool test(const Bits& bits, int position) { return test_bit(bits, position); }
+    static void clear(Bits& bits, int position) {
+        bits[position / 64] &= ~(uint64_t{1} << (position % 64));
+    }
 };
 
 template <>
@@ -1287,6 +1294,10 @@ struct FactorOps<uint64_t> {
     }
     static void add(uint64_t& target, uint64_t member) { target |= member; }
     static void retain(uint64_t& target, uint64_t active) { target &= active; }
+    static bool test(uint64_t bits, int position) { return (bits >> position) & 1U; }
+    static void clear(uint64_t& bits, int position) {
+        bits &= ~(uint64_t{1} << position);
+    }
 };
 
 // Test whether the candidate's worst extra cost relative to the other state
@@ -2005,16 +2016,23 @@ struct FactorPlan {
     std::vector<int> first;
     std::vector<int> last;
     std::vector<int> slot;
+    std::vector<int> zero_factor;
     int slot_count = 0;
 };
 
 static FactorPlan make_factor_plan(const Model& model) {
     FactorPlan plan;
+    plan.zero_factor.assign(model.zero_scopes.size(), -1);
     auto add_scopes = [&](const std::vector<std::vector<int>>& source, bool flag) {
-        for (const auto& scope : source) {
+        for (size_t source_index = 0; source_index < source.size(); ++source_index) {
+            const auto& scope = source[source_index];
             if (scope.empty()) continue;
+            const int factor = static_cast<int>(plan.scopes.size());
             plan.scopes.push_back(scope);
             plan.is_flag.push_back(flag);
+            if (!flag && source_index < model.zero_scopes.size()) {
+                plan.zero_factor[source_index] = factor;
+            }
         }
     };
     add_scopes(model.mine_scopes, true);
@@ -2157,6 +2175,33 @@ static Solution solve_frontier_core(const Model& original_model,
             }
         }
     }
+    struct OpeningPattern {
+        int factor_slot = -1;
+        std::vector<uint64_t> remaining_border;
+    };
+    std::vector<std::vector<OpeningPattern>> opening_patterns(q);
+    // Exact normalization: a pending component whose entire future reach is
+    // one opening's undecided border can be replaced by "opening still
+    // uncovered, +1 click". With no later border chord, +1 is its seed click;
+    // with one, that chord's new seed and newly saved base click cancel.
+    for (int z = 0; z < zero_count; ++z) {
+        const int factor = factors.zero_factor[z];
+        if (factor < 0 || model.zero_scopes[z].size() < 2) continue;
+        const int first = model.zero_scopes[z].front();
+        const int last = model.zero_scopes[z].back();
+        for (int i = first; i < last; ++i) {
+            std::vector<uint64_t> border(
+                compact_connectivity ? compact_signature_words : chosen_words, 0);
+            for (int candidate : model.zero_scopes[z]) {
+                if (candidate <= i) continue;
+                const int position = compact_connectivity
+                    ? connectivity_slot[candidate] : candidate;
+                border[position / 64] |= uint64_t{1} << (position % 64);
+            }
+            opening_patterns[i].push_back(
+                OpeningPattern{factors.slot[factor], std::move(border)});
+        }
+    }
     std::vector<int> last_future(q);
     for (int i = 0; i < q; ++i) {
         last_future[i] = i;
@@ -2182,6 +2227,7 @@ static Solution solve_frontier_core(const Model& original_model,
     int max_boundary = 0;
     int max_active = 0;
     size_t dominated_total = 0;
+    size_t opening_absorptions = 0;
 
     for (int i = 0; i < q; ++i) {
         const auto& new_boundary = boundaries[i + 1];
@@ -2207,6 +2253,7 @@ static Solution solve_frontier_core(const Model& original_model,
             std::vector<uint64_t> merged(signature_words);
             std::vector<uint64_t> projected(signature_words);
             std::vector<uint64_t> canonical;
+            std::vector<uint8_t> absorption_removed;
             for (const auto& [old_state, old_record] : table) {
                 if (!connectivity_ready[old_state.connectivity_id]) {
                     const auto& old_signature = connectivity_pool[old_state.connectivity_id];
@@ -2311,8 +2358,52 @@ static Solution solve_frontier_core(const Model& original_model,
                     Ops::retain(new_hits, active_after[i]);
                     const auto& connection =
                         connectivity_cache[old_state.connectivity_id][selected];
-                    const int new_cost = old_record.cost + selected + connection.closed + factor_cost;
-                    StateType state{connection.connectivity_id, std::move(new_hits)};
+                    int new_cost = old_record.cost + selected + connection.closed + factor_cost;
+                    uint32_t connectivity_id = connection.connectivity_id;
+                    if (connectivity_id != 0 && !opening_patterns[i].empty()) {
+                        const auto& signature = next_connectivity_pool[connectivity_id];
+                        const size_t component_count = signature.size() / signature_words;
+                        absorption_removed.assign(component_count, 0);
+                        bool changed = false;
+                        for (const OpeningPattern& opening : opening_patterns[i]) {
+                            if (!Ops::test(new_hits, opening.factor_slot)) continue;
+                            for (size_t component = 0; component < component_count;
+                                 ++component) {
+                                if (absorption_removed[component]) continue;
+                                const size_t offset = component * signature_words;
+                                bool equal = true;
+                                for (size_t word = 0; word < signature_words; ++word) {
+                                    if (signature[offset + word] !=
+                                        opening.remaining_border[word]) {
+                                        equal = false;
+                                        break;
+                                    }
+                                }
+                                if (!equal) continue;
+                                absorption_removed[component] = 1;
+                                Ops::clear(new_hits, opening.factor_slot);
+                                ++new_cost;
+                                ++opening_absorptions;
+                                changed = true;
+                                break;
+                            }
+                        }
+                        if (changed) {
+                            canonical.clear();
+                            canonical.reserve(signature.size());
+                            for (size_t component = 0; component < component_count;
+                                 ++component) {
+                                if (absorption_removed[component]) continue;
+                                const size_t offset = component * signature_words;
+                                canonical.insert(canonical.end(),
+                                    signature.begin() + static_cast<std::ptrdiff_t>(offset),
+                                    signature.begin() + static_cast<std::ptrdiff_t>(
+                                        offset + signature_words));
+                            }
+                            connectivity_id = next_connectivity_pool.intern(canonical);
+                        }
+                    }
+                    StateType state{connectivity_id, std::move(new_hits)};
                     auto found = next.find(state);
                     if (found == next.end()) {
                         Bits new_chosen = old_record.chosen;
@@ -2355,7 +2446,8 @@ static Solution solve_frontier_core(const Model& original_model,
                       << "/" << q << " chord candidates; " << comma_number(table.size())
                       << " valid boundary states; boundary " << new_boundary.size()
                       << " connectivity items + " << active_count << " factor bits; pruned "
-                      << comma_number(dominated_total) << " dominated states\n";
+                      << comma_number(dominated_total) << " dominated states; absorbed "
+                      << comma_number(opening_absorptions) << " opening chains\n";
         }
     }
 
@@ -2374,6 +2466,7 @@ static Solution solve_frontier_core(const Model& original_model,
     solution.peak_states = peak_states;
     solution.max_boundary_vertices = max_boundary;
     solution.max_active_factors = max_active;
+    solution.opening_chain_absorptions = opening_absorptions;
     solution.order_name = order_name;
     return solution;
 }
@@ -2383,7 +2476,8 @@ static Solution solve_frontier(const Model& original_model,
                                std::optional<int> band_size,
                                bool progress) {
     CandidateReduction reduction = reduce_candidates(original_model, progress);
-    auto [model, order_name] = choose_order(reduction.model, requested_order, band_size);
+    auto [model, order_name] = choose_order(
+        reduction.model, requested_order, band_size);
     const FactorPlan factors = make_factor_plan(model);
     Solution solution;
     if (factors.slot_count <= 64) {
@@ -2681,6 +2775,8 @@ static void print_json(const Model& model, const Solution& solution,
               << ",\"swap_dominated_chords\":" << solution.swap_dominated_chords
               << ",\"left_click_dominated_chords\":"
               << solution.left_click_dominated_chords
+              << ",\"opening_chain_absorptions\":"
+              << solution.opening_chain_absorptions
               << ",\"selected_chords\":" << solution.selected.size()
               << ",\"flag_clicks\":" << solution.flags.size()
               << ",\"component_seed_clicks\":" << solution.components.size()

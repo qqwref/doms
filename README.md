@@ -245,7 +245,8 @@ JSON output includes:
 - an ordered `actions` list using named row/column fields;
 - an ordered `clicks` list using `[type, x, y]`; and
 - search statistics, including the two candidate-reduction counts,
-  `candidate_reduction_seconds`, `peak_dp_states`, and `solve_seconds`.
+  `opening_chain_absorptions`, `candidate_reduction_seconds`,
+  `peak_dp_states`, and `solve_seconds`.
 
 `--json` and `--click-tuples` are mutually exclusive.
 
@@ -355,6 +356,15 @@ boundary slots. Standard boards therefore store each unfinished component in
 one or two 64-bit words rather than a bitset spanning every chord candidate;
 boundaries requiring more than 128 slots use the general representation.
 
+DOMS also applies **opening-chain absorption**, an exact state equivalence. If
+an unfinished chord component can reach exactly the undecided border of one
+zero opening, and that opening is already covered, the state is normalized by
+removing the component, marking the opening uncovered, and adding one click.
+If no later border chord is selected, this pays the component's eventual seed
+click; if one is selected, its new seed click and newly saved 3BV click cancel.
+The normalized state therefore has exactly the same cost under every future
+decision, but can merge with many more DP histories.
+
 The solver also applies exact dominance pruning:
 
 - Within one connectivity signature, a state is discarded when another state's
@@ -373,8 +383,11 @@ a state without proof and therefore does not make the answer approximate.
 For `--order auto`, the program evaluates row, column, and promising banded
 orders in all four sweep directions: left-to-right, right-to-left,
 top-to-bottom, and bottom-to-top. It first minimizes estimated peak frontier
-width and then estimated total work. This is important for rectangular Expert
-boards, where sweep direction can have a large effect.
+width, then the connectivity portion of a tied frontier, and finally estimated
+total work. Connectivity receives the tie-break because component partitions
+are more expensive than an equal number of independent factor bits. This is
+important for rectangular Expert boards, where sweep direction can have a
+large effect.
 
 ## Complexity and limitations
 
