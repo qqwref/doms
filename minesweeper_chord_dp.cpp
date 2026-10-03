@@ -1377,8 +1377,16 @@ public:
         std::copy_n(other.data(), size_, data());
         return *this;
     }
-    Bits(Bits&&) noexcept = default;
-    Bits& operator=(Bits&&) noexcept = default;
+    Bits(Bits&& other) noexcept
+        : size_(std::exchange(other.size_, 0)), inline_(other.inline_),
+          heap_(std::move(other.heap_)) {}
+    Bits& operator=(Bits&& other) noexcept {
+        if (this == &other) return *this;
+        size_ = std::exchange(other.size_, 0);
+        inline_ = other.inline_;
+        heap_ = std::move(other.heap_);
+        return *this;
+    }
 
     size_t size() const { return size_; }
     uint64_t* data() { return size_ > INLINE_WORDS ? heap_.get() : inline_.data(); }
