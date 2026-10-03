@@ -2,6 +2,7 @@
 // C++17 port of minesweeper_chord_dp.py.
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cctype>
@@ -25,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -79,6 +81,7 @@ struct Action {
 
 struct Solution {
     int clicks = 0;
+    bool count_only = false;
     std::vector<int> selected;
     std::vector<int> flags;
     std::vector<std::vector<int>> components;
@@ -668,13 +671,15 @@ static bool swap_dominated_candidate(const CandidateRelations& relations,
 //
 // The branch-and-bound below maximizes the last two terms over all independent
 // sets. A nonpositive maximum is therefore a proof that v is unnecessary.
-static bool left_click_dominated_candidate(const Model& model,
-                                           const CandidateRelations& relations,
-                                           int candidate) {
+static bool left_click_dominated_candidate(const CandidateRelations& relations,
+                                           int candidate,
+                                           const std::vector<int>& private_mine_counts) {
     std::vector<int> adjacent;
-    for (int other = 0; other < static_cast<int>(model.candidates.size()); ++other) {
-        if (relations.propagation[candidate][other / 64] >> (other % 64) & 1U) {
-            adjacent.push_back(other);
+    for (size_t word = 0; word < relations.propagation[candidate].size(); ++word) {
+        uint64_t neighbors = relations.propagation[candidate][word];
+        while (neighbors) {
+            adjacent.push_back(static_cast<int>(word * 64 + __builtin_ctzll(neighbors)));
+            neighbors &= neighbors - 1;
         }
     }
     // This representation keeps the proof search allocation-free and covers
@@ -682,18 +687,16 @@ static bool left_click_dominated_candidate(const Model& model,
     if (adjacent.size() > 63) return false;
 
     std::vector<int> base_ids;
-    for (int factor = 0; factor < static_cast<int>(model.base_scopes.size()); ++factor) {
-        const auto& scope = model.base_scopes[factor];
-        if (std::binary_search(scope.begin(), scope.end(), candidate)) {
-            base_ids.push_back(factor);
+    for (size_t word = 0; word < relations.base_factors[candidate].size(); ++word) {
+        uint64_t bases = relations.base_factors[candidate][word];
+        while (bases) {
+            base_ids.push_back(static_cast<int>(word * 64 + __builtin_ctzll(bases)));
+            bases &= bases - 1;
         }
     }
     if (base_ids.size() > 63) return false;
-    int private_mines = 0;
-    for (const auto& scope : model.mine_scopes) {
-        if (scope.size() == 1 && scope.front() == candidate) ++private_mines;
-    }
-    const int threshold = 2 + private_mines - static_cast<int>(base_ids.size());
+    const int threshold = 2 + private_mine_counts[candidate] -
+                          static_cast<int>(base_ids.size());
     if (threshold < 0) return false;  // The empty independent set is already a counterexample.
 
     const int degree = static_cast<int>(adjacent.size());
@@ -707,8 +710,8 @@ static bool left_click_dominated_candidate(const Model& model,
             }
         }
         for (int b = 0; b < static_cast<int>(base_ids.size()); ++b) {
-            const auto& scope = model.base_scopes[base_ids[b]];
-            if (std::binary_search(scope.begin(), scope.end(), adjacent[i])) {
+            const int factor = base_ids[b];
+            if (relations.base_factors[adjacent[i]][factor / 64] >> (factor % 64) & 1U) {
                 local_base_hits[i] |= uint64_t{1} << b;
             }
         }
@@ -758,31 +761,47 @@ static CandidateReduction reduce_candidates(const Model& original, bool progress
     while (true) {
         const int q = static_cast<int>(result.model.candidates.size());
         const CandidateRelations relations = candidate_relations(result.model);
-        int remove = -1;
-        bool by_swap = false;
-        for (int victim = 0; victim < q && remove < 0; ++victim) {
-            for (int replacement = 0; replacement < q; ++replacement) {
-                if (swap_dominated_candidate(relations, victim, replacement)) {
-                    remove = victim;
-                    by_swap = true;
-                    break;
-                }
-            }
-        }
-        if (remove < 0) {
-            for (int candidate = 0; candidate < q; ++candidate) {
-                if (left_click_dominated_candidate(result.model, relations, candidate)) {
-                    remove = candidate;
-                    break;
-                }
-            }
-        }
-        if (remove < 0) break;
         std::vector<uint8_t> keep(q, 1);
-        keep[remove] = 0;
-        result.model = restricted_model(result.model, keep);
-        if (by_swap) ++result.swap_dominated;
-        else ++result.left_click_dominated;
+        int swaps_removed = 0;
+        for (int victim = 0; victim < q; ++victim) {
+            for (int replacement = 0; replacement < q; ++replacement) {
+                if (keep[replacement] &&
+                    swap_dominated_candidate(relations, victim, replacement)) {
+                    keep[victim] = 0;
+                    ++swaps_removed;
+                    break;
+                }
+            }
+        }
+        if (swaps_removed) {
+            // Each deletion keeps its replacement. All three relation sets
+            // only shrink when candidates are removed, preserving certificates
+            // for the subsequent deletions in this batch.
+            result.model = restricted_model(result.model, keep);
+            result.swap_dominated += swaps_removed;
+            continue;
+        }
+        {
+            std::vector<int> private_mine_counts(q, 0);
+            for (const auto& scope : result.model.mine_scopes) {
+                if (scope.size() == 1) ++private_mine_counts[scope.front()];
+            }
+            int removed = 0;
+            for (int candidate = 0; candidate < q; ++candidate) {
+                if (left_click_dominated_candidate(
+                        relations, candidate, private_mine_counts)) {
+                    keep[candidate] = 0;
+                    ++removed;
+                }
+            }
+            if (removed == 0) break;
+            // This certificate remains valid after deleting other candidates:
+            // its neighborhood can only shrink, and a mine may become private.
+            // Therefore all certified candidates may be removed together.
+            result.model = restricted_model(result.model, keep);
+            result.left_click_dominated += removed;
+            continue;
+        }
     }
     result.seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - start).count();
@@ -1554,9 +1573,15 @@ struct FactorStateHash {
     }
 };
 
+template <bool TrackChosen>
 struct Record {
     int cost = 0;
     Bits chosen;
+};
+
+template <>
+struct Record<false> {
+    int cost = 0;
 };
 
 static void release_factor_storage(Bits& bits) {
@@ -1569,12 +1594,12 @@ static void release_factor_storage(uint64_t&) {}
 // it during dominance pruning. Store values densely and keep a compact open-
 // addressed index alongside them. This avoids one allocation and one pointer
 // chase per state while preserving stable dense-entry indexes during pruning.
-template <typename FactorBits>
+template <typename FactorBits, bool TrackChosen>
 class FactorTable {
 public:
     using State = FactorState<FactorBits>;
     using StateHash = FactorStateHash<FactorBits>;
-    using value_type = std::pair<State, Record>;
+    using value_type = std::pair<State, Record<TrackChosen>>;
 
     class iterator {
     public:
@@ -1664,7 +1689,7 @@ public:
 
     // Callers use find() first when duplicates are possible, so this insertion
     // path deliberately avoids a second equality scan.
-    std::pair<iterator, bool> emplace(State state, Record record) {
+    std::pair<iterator, bool> emplace(State state, Record<TrackChosen> record) {
         ensure_insert_capacity();
         const size_t entry_index = entries_.size();
         entries_.emplace_back(std::move(state), std::move(record));
@@ -1707,8 +1732,10 @@ public:
                 // Inline words occupy the dense slot regardless, but release
                 // any wide-board overflow allocations immediately.
                 release_factor_storage(entries_[entry_index].first.hits);
-                if (entries_[entry_index].second.chosen.size() > Bits::INLINE_WORDS) {
-                    entries_[entry_index].second.chosen = Bits{};
+                if constexpr (TrackChosen) {
+                    if (entries_[entry_index].second.chosen.size() > Bits::INLINE_WORDS) {
+                        entries_[entry_index].second.chosen = Bits{};
+                    }
                 }
                 return;
             }
@@ -1874,14 +1901,14 @@ static bool connectivity_coarsens(const std::vector<uint64_t>& coarse,
     return true;
 }
 
-template <typename FactorBits>
-static size_t prune_dominated(FactorTable<FactorBits>& table,
+template <typename FactorBits, bool TrackChosen>
+static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                               uint64_t comparison_limit,
                               const FactorBits& base_mask,
                               const ConnectivityPool& connectivity_pool,
                               size_t signature_words) {
     if (comparison_limit == 0 || table.size() < 2) return 0;
-    using Item = typename FactorTable<FactorBits>::iterator;
+    using Item = typename FactorTable<FactorBits, TrackChosen>::iterator;
     struct CachedItem {
         Item item;
         DominanceKey key;
@@ -2237,7 +2264,7 @@ static FactorPlan make_factor_plan(const Model& model) {
     return plan;
 }
 
-template <typename FactorBits>
+template <typename FactorBits, bool TrackChosen>
 static Solution solve_frontier_core(const Model& original_model,
                                     const Model& model,
                                     const std::string& order_name,
@@ -2245,7 +2272,7 @@ static Solution solve_frontier_core(const Model& original_model,
                                     bool progress) {
     using Ops = FactorOps<FactorBits>;
     using StateType = FactorState<FactorBits>;
-    using TableType = FactorTable<FactorBits>;
+    using TableType = FactorTable<FactorBits, TrackChosen>;
     const int q = static_cast<int>(model.candidates.size());
     const size_t factor_words = (factors.slot_count + 63) / 64;
     const size_t chosen_words = (q + 63) / 64;
@@ -2385,7 +2412,12 @@ static Solution solve_frontier_core(const Model& original_model,
 
     TableType table;
     table.reserve(16);
-    table.emplace(StateType{0, zero_factors}, Record{model.three_bv(), Bits(chosen_words)});
+    if constexpr (TrackChosen) {
+        table.emplace(StateType{0, zero_factors},
+                      Record<true>{model.three_bv(), Bits(chosen_words)});
+    } else {
+        table.emplace(StateType{0, zero_factors}, Record<false>{model.three_bv()});
+    }
     ConnectivityPool connectivity_pool;
     ConnectivityPool next_connectivity_pool;
     size_t peak_states = 1;
@@ -2571,13 +2603,20 @@ static Solution solve_frontier_core(const Model& original_model,
                     StateType state{connectivity_id, std::move(new_hits)};
                     auto found = next.find(state);
                     if (found == next.end()) {
-                        Bits new_chosen = old_record.chosen;
-                        if (selected) set_bit(new_chosen, i);
-                        next.emplace(std::move(state), Record{new_cost, std::move(new_chosen)});
+                        if constexpr (TrackChosen) {
+                            Bits new_chosen = old_record.chosen;
+                            if (selected) set_bit(new_chosen, i);
+                            next.emplace(std::move(state),
+                                         Record<true>{new_cost, std::move(new_chosen)});
+                        } else {
+                            next.emplace(std::move(state), Record<false>{new_cost});
+                        }
                     } else if (new_cost < found->second.cost) {
                         found->second.cost = new_cost;
-                        found->second.chosen = old_record.chosen;
-                        if (selected) set_bit(found->second.chosen, i);
+                        if constexpr (TrackChosen) {
+                            found->second.chosen = old_record.chosen;
+                            if (selected) set_bit(found->second.chosen, i);
+                        }
                     }
                 }
             }
@@ -2619,15 +2658,21 @@ static Solution solve_frontier_core(const Model& original_model,
     StateType final_state{0, zero_factors};
     auto final = table.find(final_state);
     if (final == table.end()) throw std::logic_error("frontier DP did not reach an empty final state");
-    std::vector<int> selected;
-    selected.reserve(q);
-    for (int i = 0; i < q; ++i) {
-        if (!test_bit(final->second.chosen, i)) continue;
-        const int cell = model.candidates[i];
-        selected.push_back(original_model.candidate_index[cell]);
+    Solution solution;
+    if constexpr (TrackChosen) {
+        std::vector<int> selected;
+        selected.reserve(q);
+        for (int i = 0; i < q; ++i) {
+            if (!test_bit(final->second.chosen, i)) continue;
+            const int cell = model.candidates[i];
+            selected.push_back(original_model.candidate_index[cell]);
+        }
+        std::sort(selected.begin(), selected.end());
+        solution = construct_solution(original_model, selected, final->second.cost);
+    } else {
+        solution.clicks = final->second.cost;
+        solution.count_only = true;
     }
-    std::sort(selected.begin(), selected.end());
-    Solution solution = construct_solution(original_model, selected, final->second.cost);
     solution.peak_states = peak_states;
     solution.max_boundary_vertices = max_boundary;
     solution.max_active_factors = max_active;
@@ -2639,17 +2684,22 @@ static Solution solve_frontier_core(const Model& original_model,
 static Solution solve_frontier(const Model& original_model,
                                const std::string& requested_order,
                                std::optional<int> band_size,
-                               bool progress) {
+                               bool progress,
+                               bool count_only = false) {
     CandidateReduction reduction = reduce_candidates(original_model, progress);
     auto [model, order_name] = choose_order(
         reduction.model, requested_order, band_size);
     const FactorPlan factors = make_factor_plan(model);
     Solution solution;
     if (factors.slot_count <= 64) {
-        solution = solve_frontier_core<uint64_t>(
+        if (count_only) solution = solve_frontier_core<uint64_t, false>(
+            original_model, model, order_name, factors, progress);
+        else solution = solve_frontier_core<uint64_t, true>(
             original_model, model, order_name, factors, progress);
     } else {
-        solution = solve_frontier_core<Bits>(
+        if (count_only) solution = solve_frontier_core<Bits, false>(
+            original_model, model, order_name, factors, progress);
+        else solution = solve_frontier_core<Bits, true>(
             original_model, model, order_name, factors, progress);
     }
     solution.candidate_chords_before_reduction =
@@ -2907,6 +2957,7 @@ static void print_json(const Model& model, const Solution& solution,
                        const std::optional<std::string>& generated_url) {
     std::cout << "{\n  \"optimal_clicks\": " << solution.clicks
               << ",\n  \"three_bv\": " << model.three_bv() << ",\n";
+    if (!solution.count_only) {
     auto print_candidate_coords = [&](const std::vector<int>& candidates) {
         std::cout << '[';
         for (size_t i = 0; i < candidates.size(); ++i) {
@@ -2948,20 +2999,25 @@ static void print_json(const Model& model, const Solution& solution,
         std::cout << "[\"" << click_word(action.type) << "\"," << action.cell % model.width + 1
                   << ',' << action.cell / model.width + 1 << ']';
     }
-    std::cout << "],\n  \"statistics\": {"
-              << "\"candidate_chords\":" << model.candidates.size()
+    std::cout << "],\n  \"statistics\": {";
+    } else {
+        std::cout << "  \"statistics\": {";
+    }
+    std::cout << "\"candidate_chords\":" << model.candidates.size()
               << ",\"candidate_chords_after_reduction\":"
               << solution.candidate_chords_after_reduction
               << ",\"swap_dominated_chords\":" << solution.swap_dominated_chords
               << ",\"left_click_dominated_chords\":"
               << solution.left_click_dominated_chords
               << ",\"opening_chain_absorptions\":"
-              << solution.opening_chain_absorptions
-              << ",\"selected_chords\":" << solution.selected.size()
-              << ",\"flag_clicks\":" << solution.flags.size()
-              << ",\"component_seed_clicks\":" << solution.components.size()
-              << ",\"remaining_3bv_clicks\":" << solution.uncovered_units.size()
-              << ",\"order\":\"" << json_escape(solution.order_name) << "\""
+              << solution.opening_chain_absorptions;
+    if (!solution.count_only) {
+        std::cout << ",\"selected_chords\":" << solution.selected.size()
+                  << ",\"flag_clicks\":" << solution.flags.size()
+                  << ",\"component_seed_clicks\":" << solution.components.size()
+                  << ",\"remaining_3bv_clicks\":" << solution.uncovered_units.size();
+    }
+    std::cout << ",\"order\":\"" << json_escape(solution.order_name) << "\""
               << ",\"peak_dp_states\":" << solution.peak_states
               << ",\"max_boundary_vertices\":" << solution.max_boundary_vertices
               << ",\"max_active_factors\":" << solution.max_active_factors
@@ -2994,6 +3050,8 @@ struct Options {
     std::optional<std::string> generate;
     std::optional<std::string> bulk;
     size_t bulk_count = 0;
+    std::optional<size_t> threads;
+    std::optional<bool> count_only;
     std::optional<uint64_t> seed;
     std::string order = "auto";
     std::optional<int> band_size;
@@ -3014,6 +3072,9 @@ static void print_help(const char* program) {
         << "  --bulk beginner|intermediate|expert COUNT\n"
         << "                                 Generate and solve COUNT boards; write CSV\n"
         << "  --seed N                       Reproduce generated or bulk boards\n"
+        << "  --threads N                    Bulk workers (default: one per available core)\n"
+        << "  --count-only                   Compute click count without a move replay\n"
+        << "  --no-count-only                Include replay (default for single boards)\n"
         << "  --order auto|rows|columns|rows-smart|columns-smart\n"
         << "  --band-size N\n"
         << "  --progress\n"
@@ -3067,6 +3128,9 @@ static Options parse_options(int argc, char** argv) {
             options.bulk_count = parse_positive_size(value_after(i, arg), arg);
         }
         else if (arg == "--seed") options.seed = parse_u64(value_after(i, arg), arg);
+        else if (arg == "--threads") options.threads = parse_positive_size(value_after(i, arg), arg);
+        else if (arg == "--count-only") options.count_only = true;
+        else if (arg == "--no-count-only") options.count_only = false;
         else if (arg == "--order") options.order = value_after(i, arg);
         else if (arg == "--band-size") options.band_size = parse_positive_int(value_after(i, arg), arg);
         else if (arg == "--progress") options.progress = true;
@@ -3105,6 +3169,10 @@ static Options parse_options(int argc, char** argv) {
         throw UserError("invalid --order value");
     }
     if (options.json && options.click_tuples) throw UserError("choose only one of --json and --click-tuples");
+    if (options.threads && !options.bulk) throw UserError("--threads requires --bulk");
+    if (options.click_tuples && options.count_only.value_or(false)) {
+        throw UserError("--click-tuples requires --no-count-only");
+    }
     return options;
 }
 
@@ -3114,27 +3182,71 @@ int main(int argc, char** argv) {
         if (options.bulk) {
             const uint64_t master_seed = options.seed.value_or(random_seed());
             std::mt19937_64 rng(master_seed);
+            const unsigned detected = std::thread::hardware_concurrency();
+            const size_t workers = std::min(options.bulk_count,
+                options.threads.value_or(detected ? detected : 1));
+            const bool count_only = options.count_only.value_or(true);
             std::cerr << "Bulk RNG: std::mt19937_64; seed: " << master_seed << "\n";
+            std::cerr << "Bulk workers: " << workers << "; "
+                      << (count_only ? "count-only" : "full replay") << " mode\n";
             std::cout << "board,3bv,optimal_clicks\n";
             const auto bulk_start = std::chrono::steady_clock::now();
-            for (size_t index = 0; index < options.bulk_count; ++index) {
-                Board board = generate_standard_board(*options.bulk, rng);
-                const std::string encoded = format_pttacg_string(board);
-                if (options.progress) {
-                    std::cerr << "Bulk board " << index + 1 << '/' << options.bulk_count
-                              << ": " << encoded << "\n";
+            // Bound outstanding boards/results while generating every board on the
+            // main thread. This preserves the seeded sequence and CSV row order.
+            for (size_t begin = 0; begin < options.bulk_count;) {
+                const size_t batch = std::min(options.bulk_count - begin,
+                                              workers * std::min<size_t>(8, 64 / workers + 1));
+                struct Job {
+                    Board board;
+                    std::string encoded;
+                    int three_bv = 0;
+                    int clicks = 0;
+                    std::string error;
+                };
+                std::vector<Job> jobs(batch);
+                for (size_t j = 0; j < batch; ++j) {
+                    jobs[j].board = generate_standard_board(*options.bulk, rng);
+                    jobs[j].encoded = format_pttacg_string(jobs[j].board);
                 }
-                try {
-                    Model model = build_model(board);
-                    Solution solution = solve_frontier(
-                        model, options.order, options.band_size, options.progress);
-                    std::cout << '"' << encoded << "\"," << model.three_bv() << ','
-                              << solution.clicks << '\n';
-                } catch (const std::exception& error) {
-                    throw UserError("bulk board " + std::to_string(index + 1) + "/" +
-                                    std::to_string(options.bulk_count) + " failed (" + encoded +
-                                    "): " + error.what());
+                std::atomic<size_t> next{0};
+                auto work = [&] {
+                    for (;;) {
+                        const size_t j = next.fetch_add(1, std::memory_order_relaxed);
+                        if (j >= batch) break;
+                        try {
+                            Model model = build_model(jobs[j].board);
+                            Solution solution = solve_frontier(
+                                model, options.order, options.band_size, false, count_only);
+                            jobs[j].three_bv = model.three_bv();
+                            jobs[j].clicks = solution.clicks;
+                        } catch (const std::exception& error) {
+                            jobs[j].error = error.what();
+                        }
+                    }
+                };
+                if (workers == 1) work();
+                else {
+                    std::vector<std::thread> pool;
+                    pool.reserve(workers);
+                    for (size_t t = 0; t < workers; ++t) pool.emplace_back(work);
+                    for (auto& thread : pool) thread.join();
                 }
+                for (size_t j = 0; j < batch; ++j) {
+                    const size_t index = begin + j;
+                    const auto& job = jobs[j];
+                    if (!job.error.empty()) {
+                        throw UserError("bulk board " + std::to_string(index + 1) + "/" +
+                                        std::to_string(options.bulk_count) + " failed (" +
+                                        job.encoded + "): " + job.error);
+                    }
+                    if (options.progress) {
+                        std::cerr << "Bulk board " << index + 1 << '/' << options.bulk_count
+                                  << ": " << job.encoded << " => " << job.clicks << " clicks\n";
+                    }
+                    std::cout << '"' << job.encoded << "\"," << job.three_bv << ','
+                              << job.clicks << '\n';
+                }
+                begin += batch;
             }
             const auto bulk_end = std::chrono::steady_clock::now();
             const double seconds =
@@ -3160,7 +3272,8 @@ int main(int argc, char** argv) {
         const auto start = std::chrono::steady_clock::now();
         Model model = build_model(board);
         Solution solution = solve_frontier(
-            model, options.order, options.band_size, options.progress);
+            model, options.order, options.band_size, options.progress,
+            options.count_only.value_or(false));
         const auto end = std::chrono::steady_clock::now();
         solution.solve_seconds = std::chrono::duration<double>(end - start).count();
         std::cerr << "Solve time: " << std::fixed << std::setprecision(3)
@@ -3175,7 +3288,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         std::cout << "Optimal clicks: " << solution.clicks << " (3BV without chording: "
-                  << model.three_bv() << ")\n"
+                  << model.three_bv() << ")\n";
+        if (!solution.count_only) std::cout
                   << "Breakdown: " << solution.flags.size() << " flags + "
                   << solution.components.size() << " seed left-clicks + "
                   << solution.selected.size() << " chords + "
@@ -3187,7 +3301,7 @@ int main(int argc, char** argv) {
                   << comma_number(solution.peak_states) << " peak states, boundary "
                   << solution.max_boundary_vertices << " connectivity items + "
                   << solution.max_active_factors << " factor bits\n";
-        std::cout << "Actions:\n";
+        if (!solution.count_only) std::cout << "Actions:\n";
         for (size_t i = 0; i < solution.actions.size(); ++i) {
             const auto& action = solution.actions[i];
             const char* name = action.type == ActionType::Flag ? "FLAG " :

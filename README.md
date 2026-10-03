@@ -26,14 +26,14 @@ dependencies.
 ### GCC or Clang
 
 ```console
-g++ -std=c++17 -O3 -DNDEBUG minesweeper_chord_dp.cpp -o doms
+g++ -std=c++17 -O3 -DNDEBUG -pthread minesweeper_chord_dp.cpp -o doms
 ```
 
 For the machine on which the binary is compiled and run, native CPU tuning may
 improve performance:
 
 ```console
-g++ -std=c++17 -O3 -DNDEBUG -march=native minesweeper_chord_dp.cpp -o doms
+g++ -std=c++17 -O3 -DNDEBUG -march=native -pthread minesweeper_chord_dp.cpp -o doms
 ```
 
 With Clang, replace `g++` with `clang++`.
@@ -49,7 +49,7 @@ cl /std:c++17 /O2 /DNDEBUG /EHsc minesweeper_chord_dp.cpp /Fe:doms.exe
 ### Windows with MinGW-w64
 
 ```console
-g++ -std=c++17 -O3 -DNDEBUG -march=native minesweeper_chord_dp.cpp -o doms.exe
+g++ -std=c++17 -O3 -DNDEBUG -march=native -pthread minesweeper_chord_dp.cpp -o doms.exe
 ```
 
 The resulting executable does not require Python.
@@ -194,6 +194,18 @@ Bulk generation uses `std::mt19937_64` and unbiased rejection sampling. Supply
 ./doms --bulk expert 10 --seed 8675309 > expert-results.csv
 ```
 
+Bulk runs use count-only DP by default: states store the cost but no chord set,
+and the solver does not reconstruct moves. By default, the solver starts one
+worker per available core (or fewer if there are fewer boards). Use `--threads N`
+to set the number of worker threads, including `--threads 1` for sequential
+execution. Board generation uses a single RNG on the main thread, so a seed
+produces the same boards and CSV row order at every thread count.
+
+For a single board, replay remains the default. Use `--count-only` to print
+only the optimal click count and DP statistics, or `--no-count-only` to request
+the full replay in a bulk run. Count-only JSON omits move and breakdown fields.
+`--click-tuples` requires replay.
+
 ## Output formats and coordinates
 
 All output coordinates are 1-based.
@@ -268,9 +280,12 @@ MBF filename, or quoted MBF hexadecimal.
 | `--generate beginner\|intermediate\|expert` | Generate, print, and solve one random standard board. Do not also supply `BOARD`. |
 | `--bulk beginner\|intermediate\|expert COUNT` | Generate and optimally solve `COUNT` boards, writing `board,3bv,optimal_clicks` CSV to standard output. |
 | `--seed N` | Reproduce a generated board or complete bulk sequence. Requires `--generate` or `--bulk`. |
+| `--threads N` | Set the number of bulk solver threads; default is one per available core. Requires `--bulk`. |
+| `--count-only` | Store only state costs and omit move reconstruction; default for bulk runs. |
+| `--no-count-only` | Reconstruct moves; default for single boards. |
 | `--order auto\|rows\|columns\|rows-smart\|columns-smart` | Choose the frontier ordering. Smart orders optimize the order within each row or column; the default is `auto`. |
 | `--band-size N` | Force a fixed band width of `N` rows or columns. With `--order auto`, compare both orientations. Without this option, auto also considers variable-width bands. |
-| `--progress` | Print frontier size and pruning progress to standard error. |
+| `--progress` | Print frontier size and pruning progress for one board; print completed boards during bulk runs. |
 | `--json` | Print machine-readable JSON. |
 | `--click-tuples` | Print only `(click_type, x, y)` tuples. |
 | `-h`, `--help` | Display command-line help. |
