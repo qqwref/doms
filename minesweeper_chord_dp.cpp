@@ -829,8 +829,10 @@ static uint64_t estimated_cut_work(int width) {
     return uint64_t{1} << std::min(width, 60);
 }
 
-static WidthEstimate width_estimate(const Model& model, const std::vector<int>& order) {
+static WidthEstimate width_estimate(const Model& model, const std::vector<int>& order,
+                                    int first_cut = 0, int end_cut = -1) {
     const int q = static_cast<int>(order.size());
+    if (end_cut < 0) end_cut = q - 1;
     std::vector<int> inverse(q);
     for (int i = 0; i < q; ++i) inverse[order[i]] = i;
     std::vector<std::pair<int, int>> graph_intervals;
@@ -871,7 +873,7 @@ static WidthEstimate width_estimate(const Model& model, const std::vector<int>& 
     int max_factors = 0;
     int max_total = 0;
     uint64_t work = 0;
-    for (int cut = 0; cut < std::max(0, q - 1); ++cut) {
+    for (int cut = first_cut; cut < end_cut; ++cut) {
         int graph = 0;
         int factors = 0;
         for (auto [lo, hi] : graph_intervals) graph += lo <= cut && cut <= hi;
@@ -1100,6 +1102,126 @@ static std::vector<int> candidate_band_sizes(int size) {
     return {values.begin(), values.end()};
 }
 
+struct DynamicBandOrder {
+    std::vector<int> order;
+    std::vector<int> widths;
+};
+
+// A cut inside [start,end) depends only on the candidates in that band:
+// all earlier lines have been processed, and all later lines are unprocessed.
+// Precompute each possible band profile, then find the partition minimizing
+// peak total width, peak connectivity width, and estimated work in that order.
+static DynamicBandOrder dynamic_band_order(const Model& model,
+                                           const std::string& orientation,
+                                           bool reverse) {
+    const bool columns = orientation == "columns";
+    const int lines = columns ? model.width : model.height;
+    const int max_band = std::min(lines, 8);
+    const int q = static_cast<int>(model.candidates.size());
+    std::vector<std::vector<int>> by_line(lines);
+    for (int i = 0; i < q; ++i) {
+        const int cell = model.candidates[i];
+        const int physical = columns ? cell % model.width : cell / model.width;
+        by_line[reverse ? lines - 1 - physical : physical].push_back(i);
+    }
+    auto secondary = [&](int i) {
+        const int cell = model.candidates[i];
+        return columns ? cell / model.width : cell % model.width;
+    };
+    std::vector<int> prefix(lines + 1, 0);
+    for (int line = 0; line < lines; ++line) {
+        std::sort(by_line[line].begin(), by_line[line].end(), [&](int a, int b) {
+            return secondary(a) < secondary(b);
+        });
+        prefix[line + 1] = prefix[line] + static_cast<int>(by_line[line].size());
+    }
+
+    struct Edge {
+        WidthEstimate estimate;
+        std::vector<int> inside;
+    };
+    std::vector<std::vector<Edge>> edge(lines);
+    for (int start = 0; start < lines; ++start) {
+        for (int end = start + 1; end <= std::min(lines, start + max_band); ++end) {
+            auto& current = edge[start].emplace_back();
+            for (int line = start; line < end; ++line) {
+                current.inside.insert(current.inside.end(),
+                                      by_line[line].begin(), by_line[line].end());
+            }
+            std::sort(current.inside.begin(), current.inside.end(),
+                      [&](int a, int b) {
+                          const int sa = secondary(a), sb = secondary(b);
+                          if (sa != sb) return sa < sb;
+                          const int ca = model.candidates[a], cb = model.candidates[b];
+                          const int la = columns ? ca % model.width : ca / model.width;
+                          const int lb = columns ? cb % model.width : cb / model.width;
+                          return (reverse ? la > lb : la < lb);
+                      });
+            std::vector<int> trial;
+            trial.reserve(q);
+            for (int line = 0; line < start; ++line) {
+                trial.insert(trial.end(), by_line[line].begin(), by_line[line].end());
+            }
+            trial.insert(trial.end(), current.inside.begin(), current.inside.end());
+            for (int line = end; line < lines; ++line) {
+                trial.insert(trial.end(), by_line[line].begin(), by_line[line].end());
+            }
+            current.estimate = width_estimate(model, trial, prefix[start],
+                                               std::min(prefix[end], q - 1));
+        }
+    }
+
+    constexpr int infinity = std::numeric_limits<int>::max();
+    std::vector<int> min_total(lines + 1, infinity);
+    min_total[0] = 0;
+    for (int end = 1; end <= lines; ++end) {
+        for (int start = std::max(0, end - max_band); start < end; ++start) {
+            min_total[end] = std::min(min_total[end],
+                std::max(min_total[start], std::get<0>(edge[start][end - start - 1].estimate)));
+        }
+    }
+    std::vector<int> min_graph(lines + 1, infinity);
+    min_graph[0] = 0;
+    for (int end = 1; end <= lines; ++end) {
+        for (int start = std::max(0, end - max_band); start < end; ++start) {
+            const auto& estimate = edge[start][end - start - 1].estimate;
+            if (std::get<0>(estimate) > min_total[lines] || min_graph[start] == infinity) continue;
+            min_graph[end] = std::min(min_graph[end],
+                std::max(min_graph[start], std::get<1>(estimate)));
+        }
+    }
+    std::vector<uint64_t> min_work(lines + 1, std::numeric_limits<uint64_t>::max());
+    std::vector<int> previous(lines + 1, -1);
+    min_work[0] = 0;
+    for (int end = 1; end <= lines; ++end) {
+        for (int start = std::max(0, end - max_band); start < end; ++start) {
+            const auto& estimate = edge[start][end - start - 1].estimate;
+            if (std::get<0>(estimate) > min_total[lines] ||
+                std::get<1>(estimate) > min_graph[lines] ||
+                (start != 0 && previous[start] < 0)) continue;
+            const uint64_t work = saturated_add(min_work[start], std::get<3>(estimate));
+            if (previous[end] < 0 || work < min_work[end]) {
+                min_work[end] = work;
+                previous[end] = start;
+            }
+        }
+    }
+    if (previous[lines] < 0) throw std::logic_error("dynamic band partition not found");
+    std::vector<std::pair<int, int>> bands;
+    for (int end = lines; end > 0; end = previous[end]) {
+        bands.emplace_back(previous[end], end);
+    }
+    std::reverse(bands.begin(), bands.end());
+    DynamicBandOrder result;
+    result.order.reserve(q);
+    for (auto [start, end] : bands) {
+        result.widths.push_back(end - start);
+        const auto& inside = edge[start][end - start - 1].inside;
+        result.order.insert(result.order.end(), inside.begin(), inside.end());
+    }
+    return result;
+}
+
 struct OrderChoice {
     WidthEstimate estimate;
     std::string name;
@@ -1185,6 +1307,20 @@ static std::pair<Model, std::string> choose_order(const Model& model,
                 (candidate.reverse ? "-reverse" : "") +
                 "-band-" + std::to_string(candidate.size);
             choices.push_back({estimate, label, std::move(order)});
+        }
+    }
+    if (!band_size) {
+        for (const std::string orientation : {"columns", "rows"}) {
+            for (bool reverse : {false, true}) {
+                auto dynamic = dynamic_band_order(model, orientation, reverse);
+                auto estimate = width_estimate(model, dynamic.order);
+                std::string label = orientation + (reverse ? "-reverse" : "") + "-dynamic-";
+                for (size_t i = 0; i < dynamic.widths.size(); ++i) {
+                    if (i) label += '.';
+                    label += std::to_string(dynamic.widths[i]);
+                }
+                choices.push_back({estimate, std::move(label), std::move(dynamic.order)});
+            }
         }
     }
     auto best = std::min_element(choices.begin(), choices.end(), [](const auto& a, const auto& b) {
@@ -1975,6 +2111,27 @@ static size_t prune_dominated(FactorTable<FactorBits>& table,
 static std::vector<int> ordered_region_ranks(const Model& model, const std::string& order_name) {
     const bool rows = order_name.rfind("rows", 0) == 0;
     const bool reverse = order_name.find("-reverse") != std::string::npos;
+    const size_t dynamic_marker = order_name.find("-dynamic-");
+    std::vector<int> dynamic_group;
+    std::vector<int> dynamic_position;
+    if (dynamic_marker != std::string::npos) {
+        const int line_count = rows ? model.height : model.width;
+        dynamic_group.resize(line_count);
+        dynamic_position.resize(line_count);
+        const std::string widths = order_name.substr(dynamic_marker + 9);
+        std::istringstream input(widths);
+        std::string token;
+        int line = 0, group = 0;
+        while (std::getline(input, token, '.')) {
+            const int width = std::stoi(token);
+            for (int offset = 0; offset < width && line < line_count; ++offset, ++line) {
+                dynamic_group[line] = group;
+                dynamic_position[line] = offset;
+            }
+            ++group;
+        }
+        if (line != line_count) throw std::logic_error("invalid dynamic band widths");
+    }
     int band = 1;
     const size_t marker = order_name.rfind("-band-");
     if (marker != std::string::npos) band = std::stoi(order_name.substr(marker + 6));
@@ -1985,9 +2142,17 @@ static std::vector<int> ordered_region_ranks(const Model& model, const std::stri
         const int c = cell % model.width;
         if (rows) {
             const int line = reverse ? model.height - 1 - r : r;
+            if (!dynamic_group.empty()) {
+                return std::tuple<int, int, int>{dynamic_group[line], c,
+                                                  dynamic_position[line]};
+            }
             return std::tuple<int, int, int>{line / band, c, line % band};
         }
         const int line = reverse ? model.width - 1 - c : c;
+        if (!dynamic_group.empty()) {
+            return std::tuple<int, int, int>{dynamic_group[line], r,
+                                              dynamic_position[line]};
+        }
         return std::tuple<int, int, int>{line / band, r, line % band};
     };
     std::sort(cells.begin(), cells.end(), [&](int a, int b) { return key(a) < key(b); });

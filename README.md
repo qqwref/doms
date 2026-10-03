@@ -265,7 +265,7 @@ MBF filename, or quoted MBF hexadecimal.
 | `--bulk beginner\|intermediate\|expert COUNT` | Generate and optimally solve `COUNT` boards, writing `board,3bv,optimal_clicks` CSV to standard output. |
 | `--seed N` | Reproduce a generated board or complete bulk sequence. Requires `--generate` or `--bulk`. |
 | `--order auto\|rows\|columns\|rows-smart\|columns-smart` | Choose the frontier ordering. Smart orders optimize the order within each row or column; the default is `auto`. |
-| `--band-size N` | Set a band width of `N` rows or columns. With `--order auto`, compare both orientations. |
+| `--band-size N` | Force a fixed band width of `N` rows or columns. With `--order auto`, compare both orientations. Without this option, auto also considers variable-width bands. |
 | `--progress` | Print frontier size and pruning progress to standard error. |
 | `--json` | Print machine-readable JSON. |
 | `--click-tuples` | Print only `(click_type, x, y)` tuples. |
@@ -388,6 +388,16 @@ total work. Connectivity receives the tie-break because component partitions
 are more expensive than an equal number of independent factor bits. This is
 important for rectangular Expert boards, where sweep direction can have a
 large effect.
+
+Automatic ordering also tries bands whose widths change across the board. It
+computes the frontier profile for each contiguous band of one through eight
+rows or columns, then uses a short dynamic program to choose band boundaries.
+The three optimization passes minimize peak estimated width, peak connectivity
+width, and accumulated estimated work, in that order. A selected order such as
+`columns-dynamic-7.4.1.1.8.1.6.2` lists its consecutive band widths. The
+search still evaluates the exact click objective regardless of which ordering
+is chosen. Supplying `--band-size` continues to force the requested fixed
+width.
 
 ## Complexity and limitations
 
