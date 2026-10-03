@@ -87,6 +87,11 @@ struct Solution {
     size_t peak_states = 0;
     int max_boundary_vertices = 0;
     int max_active_factors = 0;
+    int candidate_chords_before_reduction = 0;
+    int candidate_chords_after_reduction = 0;
+    int swap_dominated_chords = 0;
+    int left_click_dominated_chords = 0;
+    double reduction_seconds = 0.0;
     std::string order_name;
     double solve_seconds = 0.0;
 };
@@ -519,6 +524,274 @@ static Model ordered_model(const Model& model, const std::vector<int>& order) {
     result.zero_scopes = remap(model.zero_scopes);
     result.mine_scopes = remap(model.mine_scopes);
     result.base_scopes = remap(model.base_scopes);
+    return result;
+}
+
+// Return the same optimization problem restricted to the candidates marked in
+// keep. Empty factor scopes are deliberately retained: they represent a 3BV
+// unit which no remaining chord can open (or a mine which no remaining chord
+// can require).
+static Model restricted_model(const Model& model, const std::vector<uint8_t>& keep) {
+    const int old_q = static_cast<int>(model.candidates.size());
+    std::vector<int> old_to_new(old_q, -1);
+    std::vector<int> retained;
+    retained.reserve(old_q);
+    for (int old = 0; old < old_q; ++old) {
+        if (!keep[old]) continue;
+        old_to_new[old] = static_cast<int>(retained.size());
+        retained.push_back(old);
+    }
+
+    Model result = model;
+    result.candidates.clear();
+    result.candidates.reserve(retained.size());
+    for (int old : retained) result.candidates.push_back(model.candidates[old]);
+    result.candidate_index.assign(model.height * model.width, -1);
+    for (int next = 0; next < static_cast<int>(result.candidates.size()); ++next) {
+        result.candidate_index[result.candidates[next]] = next;
+    }
+    result.graph.assign(retained.size(), {});
+    for (int next = 0; next < static_cast<int>(retained.size()); ++next) {
+        for (int old_other : model.graph[retained[next]]) {
+            if (old_to_new[old_other] >= 0) {
+                result.graph[next].push_back(old_to_new[old_other]);
+            }
+        }
+    }
+    auto restrict_scopes = [&](const std::vector<std::vector<int>>& scopes) {
+        std::vector<std::vector<int>> restricted;
+        restricted.reserve(scopes.size());
+        for (const auto& scope : scopes) {
+            std::vector<int> next;
+            next.reserve(scope.size());
+            for (int old : scope) {
+                if (old_to_new[old] >= 0) next.push_back(old_to_new[old]);
+            }
+            restricted.push_back(std::move(next));
+        }
+        return restricted;
+    };
+    result.zero_scopes = restrict_scopes(model.zero_scopes);
+    result.mine_scopes = restrict_scopes(model.mine_scopes);
+    result.base_scopes = restrict_scopes(model.base_scopes);
+    return result;
+}
+
+struct CandidateReduction {
+    Model model;
+    int swap_dominated = 0;
+    int left_click_dominated = 0;
+    double seconds = 0.0;
+};
+
+struct CandidateRelations {
+    std::vector<std::vector<uint64_t>> propagation;
+    std::vector<std::vector<uint64_t>> mine_factors;
+    std::vector<std::vector<uint64_t>> base_factors;
+};
+
+static CandidateRelations candidate_relations(const Model& model) {
+    const int q = static_cast<int>(model.candidates.size());
+    const size_t candidate_words = (q + 63) / 64;
+    const size_t mine_words = (model.mine_scopes.size() + 63) / 64;
+    const size_t base_words = (model.base_scopes.size() + 63) / 64;
+    CandidateRelations relations;
+    relations.propagation.assign(q, std::vector<uint64_t>(candidate_words, 0));
+    relations.mine_factors.assign(q, std::vector<uint64_t>(mine_words, 0));
+    relations.base_factors.assign(q, std::vector<uint64_t>(base_words, 0));
+    auto connect = [&](int a, int b) {
+        if (a == b) return;
+        relations.propagation[a][b / 64] |= uint64_t{1} << (b % 64);
+        relations.propagation[b][a / 64] |= uint64_t{1} << (a % 64);
+    };
+    for (int candidate = 0; candidate < q; ++candidate) {
+        for (int other : model.graph[candidate]) connect(candidate, other);
+    }
+    for (const auto& scope : model.zero_scopes) {
+        for (size_t i = 0; i < scope.size(); ++i) {
+            for (size_t j = i + 1; j < scope.size(); ++j) connect(scope[i], scope[j]);
+        }
+    }
+    for (size_t factor = 0; factor < model.mine_scopes.size(); ++factor) {
+        for (int candidate : model.mine_scopes[factor]) {
+            relations.mine_factors[candidate][factor / 64] |= uint64_t{1} << (factor % 64);
+        }
+    }
+    for (size_t factor = 0; factor < model.base_scopes.size(); ++factor) {
+        for (int candidate : model.base_scopes[factor]) {
+            relations.base_factors[candidate][factor / 64] |= uint64_t{1} << (factor % 64);
+        }
+    }
+    return relations;
+}
+
+static bool bits_subset(const std::vector<uint64_t>& subset,
+                        const std::vector<uint64_t>& superset) {
+    for (size_t word = 0; word < subset.size(); ++word) {
+        if (subset[word] & ~superset[word]) return false;
+    }
+    return true;
+}
+
+// If every role played by victim is also played at least as cheaply by
+// replacement, any solution using victim can replace it (or simply delete it
+// when replacement is already selected). This preserves 3BV coverage and
+// chord-component connectivity while never adding a flag.
+static bool swap_dominated_candidate(const CandidateRelations& relations,
+                                     int victim, int replacement) {
+    if (victim == replacement) return false;
+    if (!(relations.propagation[victim][replacement / 64] >> (replacement % 64) & 1U)) {
+        return false;
+    }
+    if (!bits_subset(relations.base_factors[victim],
+                     relations.base_factors[replacement])) return false;
+    if (!bits_subset(relations.mine_factors[replacement],
+                     relations.mine_factors[victim])) return false;
+    for (size_t word = 0; word < relations.propagation[victim].size(); ++word) {
+        uint64_t needed = relations.propagation[victim][word];
+        if (word == static_cast<size_t>(replacement / 64)) {
+            needed &= ~(uint64_t{1} << (replacement % 64));
+        }
+        if (needed & ~relations.propagation[replacement][word]) return false;
+    }
+    return true;
+}
+
+// Certify that deleting candidate v can never increase the objective. Let X be
+// the selected propagation-neighbors of v. Removing v saves its chord click,
+// and saves a seed click when X is empty. Otherwise it can split its component
+// into at most cc(G[X]) pieces. Choosing one representative from every piece
+// gives an independent set I, so the worst case is exactly bounded by
+//
+//   bases(v) - 2 - private_mines(v) + |I| - bases_hit(I).
+//
+// The branch-and-bound below maximizes the last two terms over all independent
+// sets. A nonpositive maximum is therefore a proof that v is unnecessary.
+static bool left_click_dominated_candidate(const Model& model,
+                                           const CandidateRelations& relations,
+                                           int candidate) {
+    std::vector<int> adjacent;
+    for (int other = 0; other < static_cast<int>(model.candidates.size()); ++other) {
+        if (relations.propagation[candidate][other / 64] >> (other % 64) & 1U) {
+            adjacent.push_back(other);
+        }
+    }
+    // This representation keeps the proof search allocation-free and covers
+    // ordinary standard boards. Skipping a larger neighborhood is conservative.
+    if (adjacent.size() > 63) return false;
+
+    std::vector<int> base_ids;
+    for (int factor = 0; factor < static_cast<int>(model.base_scopes.size()); ++factor) {
+        const auto& scope = model.base_scopes[factor];
+        if (std::binary_search(scope.begin(), scope.end(), candidate)) {
+            base_ids.push_back(factor);
+        }
+    }
+    if (base_ids.size() > 63) return false;
+    int private_mines = 0;
+    for (const auto& scope : model.mine_scopes) {
+        if (scope.size() == 1 && scope.front() == candidate) ++private_mines;
+    }
+    const int threshold = 2 + private_mines - static_cast<int>(base_ids.size());
+    if (threshold < 0) return false;  // The empty independent set is already a counterexample.
+
+    const int degree = static_cast<int>(adjacent.size());
+    std::vector<uint64_t> local_edges(degree, 0);
+    std::vector<uint64_t> local_base_hits(degree, 0);
+    for (int i = 0; i < degree; ++i) {
+        for (int j = 0; j < degree; ++j) {
+            if (relations.propagation[adjacent[i]][adjacent[j] / 64] >>
+                    (adjacent[j] % 64) & 1U) {
+                local_edges[i] |= uint64_t{1} << j;
+            }
+        }
+        for (int b = 0; b < static_cast<int>(base_ids.size()); ++b) {
+            const auto& scope = model.base_scopes[base_ids[b]];
+            if (std::binary_search(scope.begin(), scope.end(), adjacent[i])) {
+                local_base_hits[i] |= uint64_t{1} << b;
+            }
+        }
+    }
+
+    int best = 0;
+    bool exceeds_threshold = false;
+    auto search = [&](auto&& self, uint64_t available, int chosen,
+                      uint64_t covered) -> void {
+        if (exceeds_threshold) return;
+        best = std::max(best, chosen - __builtin_popcountll(covered));
+        if (best > threshold) {
+            exceeds_threshold = true;
+            return;
+        }
+        const int optimistic = chosen + __builtin_popcountll(available) -
+                               __builtin_popcountll(covered);
+        if (optimistic <= best || !available) return;
+
+        int pivot = __builtin_ctzll(available);
+        int pivot_degree = -1;
+        uint64_t scan = available;
+        while (scan) {
+            const int vertex = __builtin_ctzll(scan);
+            scan &= scan - 1;
+            const int current_degree =
+                __builtin_popcountll(local_edges[vertex] & available);
+            if (current_degree > pivot_degree) {
+                pivot = vertex;
+                pivot_degree = current_degree;
+            }
+        }
+        const uint64_t pivot_bit = uint64_t{1} << pivot;
+        self(self, available & ~pivot_bit & ~local_edges[pivot], chosen + 1,
+             covered | local_base_hits[pivot]);
+        self(self, available & ~pivot_bit, chosen, covered);
+    };
+    const uint64_t all = degree == 0 ? 0 :
+        (degree == 64 ? ~uint64_t{0} : (uint64_t{1} << degree) - 1);
+    search(search, all, 0, 0);
+    return !exceeds_threshold;
+}
+
+static CandidateReduction reduce_candidates(const Model& original, bool progress) {
+    const auto start = std::chrono::steady_clock::now();
+    CandidateReduction result{original};
+    while (true) {
+        const int q = static_cast<int>(result.model.candidates.size());
+        const CandidateRelations relations = candidate_relations(result.model);
+        int remove = -1;
+        bool by_swap = false;
+        for (int victim = 0; victim < q && remove < 0; ++victim) {
+            for (int replacement = 0; replacement < q; ++replacement) {
+                if (swap_dominated_candidate(relations, victim, replacement)) {
+                    remove = victim;
+                    by_swap = true;
+                    break;
+                }
+            }
+        }
+        if (remove < 0) {
+            for (int candidate = 0; candidate < q; ++candidate) {
+                if (left_click_dominated_candidate(result.model, relations, candidate)) {
+                    remove = candidate;
+                    break;
+                }
+            }
+        }
+        if (remove < 0) break;
+        std::vector<uint8_t> keep(q, 1);
+        keep[remove] = 0;
+        result.model = restricted_model(result.model, keep);
+        if (by_swap) ++result.swap_dominated;
+        else ++result.left_click_dominated;
+    }
+    result.seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    if (progress) {
+        std::cerr << "Candidate reduction: " << original.candidates.size() << " -> "
+                  << result.model.candidates.size() << " chords ("
+                  << result.swap_dominated << " swap-dominated, "
+                  << result.left_click_dominated << " left-click-dominated) in "
+                  << std::fixed << std::setprecision(3) << result.seconds << " seconds\n";
+    }
     return result;
 }
 
@@ -2109,14 +2382,25 @@ static Solution solve_frontier(const Model& original_model,
                                const std::string& requested_order,
                                std::optional<int> band_size,
                                bool progress) {
-    auto [model, order_name] = choose_order(original_model, requested_order, band_size);
+    CandidateReduction reduction = reduce_candidates(original_model, progress);
+    auto [model, order_name] = choose_order(reduction.model, requested_order, band_size);
     const FactorPlan factors = make_factor_plan(model);
+    Solution solution;
     if (factors.slot_count <= 64) {
-        return solve_frontier_core<uint64_t>(
+        solution = solve_frontier_core<uint64_t>(
+            original_model, model, order_name, factors, progress);
+    } else {
+        solution = solve_frontier_core<Bits>(
             original_model, model, order_name, factors, progress);
     }
-    return solve_frontier_core<Bits>(
-        original_model, model, order_name, factors, progress);
+    solution.candidate_chords_before_reduction =
+        static_cast<int>(original_model.candidates.size());
+    solution.candidate_chords_after_reduction =
+        static_cast<int>(reduction.model.candidates.size());
+    solution.swap_dominated_chords = reduction.swap_dominated;
+    solution.left_click_dominated_chords = reduction.left_click_dominated;
+    solution.reduction_seconds = reduction.seconds;
+    return solution;
 }
 
 struct Evaluation {
@@ -2392,6 +2676,11 @@ static void print_json(const Model& model, const Solution& solution,
     }
     std::cout << "],\n  \"statistics\": {"
               << "\"candidate_chords\":" << model.candidates.size()
+              << ",\"candidate_chords_after_reduction\":"
+              << solution.candidate_chords_after_reduction
+              << ",\"swap_dominated_chords\":" << solution.swap_dominated_chords
+              << ",\"left_click_dominated_chords\":"
+              << solution.left_click_dominated_chords
               << ",\"selected_chords\":" << solution.selected.size()
               << ",\"flag_clicks\":" << solution.flags.size()
               << ",\"component_seed_clicks\":" << solution.components.size()
@@ -2400,6 +2689,8 @@ static void print_json(const Model& model, const Solution& solution,
               << ",\"peak_dp_states\":" << solution.peak_states
               << ",\"max_boundary_vertices\":" << solution.max_boundary_vertices
               << ",\"max_active_factors\":" << solution.max_active_factors
+              << ",\"candidate_reduction_seconds\":" << std::fixed
+              << std::setprecision(6) << solution.reduction_seconds
               << ",\"solve_seconds\":" << std::fixed << std::setprecision(6)
               << solution.solve_seconds << '}';
     if (generated_url) {
@@ -2614,6 +2905,9 @@ int main(int argc, char** argv) {
                   << solution.selected.size() << " chords + "
                   << solution.uncovered_units.size() << " remaining 3BV clicks\n";
         std::cout << "DP: " << solution.order_name << " order, "
+                  << solution.candidate_chords_after_reduction << '/'
+                  << solution.candidate_chords_before_reduction
+                  << " chord candidates after proven reductions, "
                   << comma_number(solution.peak_states) << " peak states, boundary "
                   << solution.max_boundary_vertices << " connectivity items + "
                   << solution.max_active_factors << " factor bits\n";

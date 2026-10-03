@@ -209,6 +209,7 @@ The default output includes:
 - the optimal click count and unchorded 3BV;
 - a breakdown into flags, component-seeding left-clicks, chords, and remaining
   3BV clicks;
+- the number of chord candidates before and after proven preprocessing;
 - frontier-DP statistics; and
 - the complete ordered action sequence.
 
@@ -243,7 +244,8 @@ JSON output includes:
 - chord components and remaining base clicks;
 - an ordered `actions` list using named row/column fields;
 - an ordered `clicks` list using `[type, x, y]`; and
-- search statistics, including `peak_dp_states` and `solve_seconds`.
+- search statistics, including the two candidate-reduction counts,
+  `candidate_reduction_seconds`, `peak_dp_states`, and `solve_seconds`.
 
 `--json` and `--click-tuples` are mutually exclusive.
 
@@ -317,6 +319,26 @@ and one for every nonzero safe square not adjacent to a zero.
 
 ## Algorithm overview
 
+Before choosing a sweep order, DOMS repeatedly removes chord candidates using
+two exact certificates:
+
+- **Swap domination.** Candidate `v` can be removed when an adjacent candidate
+  `u` covers every 3BV unit covered by `v`, requires a subset of `v`'s mines,
+  and preserves every propagation connection of `v`. Any solution using `v`
+  can use `u` instead; if it already uses `u`, it can simply delete `v`.
+- **Left-click domination.** DOMS bounds the effect of deleting a chord for
+  every possible arrangement of its selected propagation neighbors. The worst
+  possible component split is represented by an independent set of those
+  neighbors. A small branch-and-bound proof search compares that split and any
+  lost 3BV coverage with the saved chord click, seed click, and mines usable by
+  no other remaining chord. The candidate is removed only when the bound is
+  nonpositive for every independent set.
+
+The reductions are applied iteratively. Each step proves that every solution
+using the removed candidate has a no-worse solution without it, so composing
+the steps preserves the global optimum. `--progress` prints the before/after
+candidate counts and the time spent proving the reductions.
+
 The primary solver is a frontier dynamic program over possible chord sets.
 Candidates are processed in a spatial sweep. A boundary state records:
 
@@ -362,7 +384,9 @@ area.
 
 Let:
 
-- `q` be the number of numbered safe squares that could be chorded;
+- `q0` be the original number of numbered safe squares that could be chorded;
+- `q` be the number left after proven candidate reduction (`q <= q0`);
+- `d` be the largest propagation neighborhood examined by the local reduction;
 - `b` be the maximum number of future-relevant connectivity items at a cut;
 - `f` be the maximum number of active mine/3BV factors; and
 - `S` be the maximum number of retained DP states.
@@ -396,6 +420,13 @@ cached, dominance normally stops early, and safe prefilters reject most
 signature pairs without running the full matching test. Actual performance
 depends heavily on the board, processing order, state merging, and dominance
 pruning.
+
+Candidate preprocessing performs polynomial subset and connectivity checks for
+swap domination. Its local independent-set certificate is exponential in `d`
+in the worst case, although dense opening boundaries prune strongly; a
+neighborhood larger than 63 is conservatively left unreduced. This does not
+affect exactness. On intended boards, the reduced `q`, `b`, and `f` generally
+save much more time than preprocessing consumes.
 
 Some unusually connected boards can still use a large amount of memory or take
 a long time. Useful responses are:
