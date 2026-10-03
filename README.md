@@ -231,6 +231,10 @@ This prints a list of:
 
 `right` means place a flag.
 
+The replay places each flag immediately before the first chord that needs that
+mine. Component-opening left clicks and the chord order remain the same, so
+the replay still uses the optimal number of clicks.
+
 ### JSON
 
 ```console

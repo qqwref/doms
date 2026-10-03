@@ -2835,13 +2835,28 @@ static Solution construct_solution(const Model& model, const std::vector<int>& s
     solution.flags = evaluation.flags;
     solution.components = evaluation.components;
     solution.uncovered_units = evaluation.uncovered;
-    for (int cell : solution.flags) solution.actions.push_back({ActionType::Flag, cell});
+    solution.actions.reserve(solution.clicks);
+    std::vector<uint8_t> flagged(model.height * model.width, 0);
+    int flags_placed = 0;
     for (const auto& component : solution.components) {
         const auto order = component_chord_order(model, component);
         solution.actions.push_back({ActionType::Left, model.candidates[order.front()]});
         for (int candidate : order) {
-            solution.actions.push_back({ActionType::Chord, model.candidates[candidate]});
+            const int chord_cell = model.candidates[candidate];
+            // Place each flag only when the first chord that needs it is about
+            // to happen. The chosen chord order and click count stay intact.
+            for (int adjacent : neighbors(chord_cell, model.height, model.width)) {
+                if (model.mines[adjacent] && !flagged[adjacent]) {
+                    flagged[adjacent] = 1;
+                    ++flags_placed;
+                    solution.actions.push_back({ActionType::Flag, adjacent});
+                }
+            }
+            solution.actions.push_back({ActionType::Chord, chord_cell});
         }
+    }
+    if (flags_placed != static_cast<int>(solution.flags.size())) {
+        throw std::logic_error("replay flag count disagrees with chord set");
     }
     for (int unit : solution.uncovered_units) {
         solution.actions.push_back({ActionType::Left, model.base_descriptions[unit].representative});
