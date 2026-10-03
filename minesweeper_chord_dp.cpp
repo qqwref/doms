@@ -496,7 +496,9 @@ static Model build_model(const Board& board) {
 }
 
 static Model ordered_model(const Model& model, const std::vector<int>& order) {
-    Model result = model;
+    Model result;
+    result.height = model.height;
+    result.width = model.width;
     const int q = static_cast<int>(order.size());
     std::vector<int> inverse(q);
     result.candidates.clear();
@@ -505,8 +507,7 @@ static Model ordered_model(const Model& model, const std::vector<int>& order) {
         inverse[order[next]] = next;
         result.candidates.push_back(model.candidates[order[next]]);
     }
-    result.candidate_index.assign(model.height * model.width, -1);
-    for (int i = 0; i < q; ++i) result.candidate_index[result.candidates[i]] = i;
+    // Only the original model needs cell-to-candidate lookup or board arrays.
     result.graph.assign(q, {});
     for (int old_i : order) {
         const int next_i = inverse[old_i];
@@ -546,14 +547,14 @@ static Model restricted_model(const Model& model, const std::vector<uint8_t>& ke
         retained.push_back(old);
     }
 
-    Model result = model;
-    result.candidates.clear();
+    // The reduced model only feeds ordering and the DP. Replay and board
+    // validation use the untouched original model, so copying those arrays
+    // (and then replacing most scopes) on every deletion is wasted work.
+    Model result;
+    result.height = model.height;
+    result.width = model.width;
     result.candidates.reserve(retained.size());
     for (int old : retained) result.candidates.push_back(model.candidates[old]);
-    result.candidate_index.assign(model.height * model.width, -1);
-    for (int next = 0; next < static_cast<int>(result.candidates.size()); ++next) {
-        result.candidate_index[result.candidates[next]] = next;
-    }
     result.graph.assign(retained.size(), {});
     for (int next = 0; next < static_cast<int>(retained.size()); ++next) {
         for (int old_other : model.graph[retained[next]]) {
@@ -2296,13 +2297,8 @@ static Solution solve_frontier_core(const Model& original_model,
 
     const int zero_count = static_cast<int>(model.zero_scopes.size());
     std::vector<std::vector<int>> zero_memberships(q);
-    std::vector<std::pair<int, int>> zero_limits;
     for (int z = 0; z < zero_count; ++z) {
-        if (model.zero_scopes[z].empty()) zero_limits.emplace_back(0, -1);
-        else {
-            zero_limits.emplace_back(model.zero_scopes[z].front(), model.zero_scopes[z].back());
-            for (int variable : model.zero_scopes[z]) zero_memberships[variable].push_back(z);
-        }
+        for (int variable : model.zero_scopes[z]) zero_memberships[variable].push_back(z);
     }
     std::vector<Bits> future_neighbors(q, Bits(chosen_words));
     for (int i = 0; i < q; ++i) {
@@ -2394,20 +2390,22 @@ static Solution solve_frontier_core(const Model& original_model,
                 OpeningPattern{factors.slot[factor], std::move(border)});
         }
     }
-    std::vector<int> last_future(q);
-    for (int i = 0; i < q; ++i) {
-        last_future[i] = i;
-        for (int other : model.graph[i]) if (other > i) last_future[i] = std::max(last_future[i], other);
+    // Only boundary sizes are used for statistics. Each graph vertex or zero
+    // scope contributes over an interval of cuts; count those with a prefix
+    // sum instead of retaining every boundary's vertex list.
+    std::vector<int> boundary_delta(q + 1, 0);
+    for (int v = 0; v < q; ++v) {
+        int last = v;
+        for (int other : model.graph[v]) last = std::max(last, other);
+        ++boundary_delta[v];
+        --boundary_delta[last];
     }
-    std::vector<std::vector<int>> boundaries(q + 1);
-    for (int i = 0; i < q; ++i) {
-        for (int v = 0; v <= i; ++v) if (last_future[v] > i) boundaries[i + 1].push_back(v);
-        for (int z = 0; z < zero_count; ++z) {
-            if (zero_limits[z].first <= i && i < zero_limits[z].second) {
-                boundaries[i + 1].push_back(q + z);
-            }
-        }
+    for (const auto& scope : model.zero_scopes) {
+        if (scope.empty()) continue;
+        ++boundary_delta[scope.front()];
+        --boundary_delta[scope.back()];
     }
+    int boundary_size = 0;
     const auto region_ranks = progress ? ordered_region_ranks(model, order_name) : std::vector<int>{};
 
     TableType table;
@@ -2427,7 +2425,8 @@ static Solution solve_frontier_core(const Model& original_model,
     size_t opening_absorptions = 0;
 
     for (int i = 0; i < q; ++i) {
-        const auto& new_boundary = boundaries[i + 1];
+        boundary_size += boundary_delta[i];
+        const int new_boundary_size = boundary_size;
         const size_t signature_words = compact_connectivity
             ? compact_signature_words : chosen_words;
         const int current_connectivity_slot = compact_connectivity
@@ -2641,14 +2640,14 @@ static Solution solve_frontier_core(const Model& original_model,
         connectivity_pool.swap(next_connectivity_pool);
         dominated_total += removed;
         peak_states = std::max(peak_states, table.size());
-        max_boundary = std::max(max_boundary, static_cast<int>(new_boundary.size()));
+        max_boundary = std::max(max_boundary, new_boundary_size);
         const int active_count = Ops::count(active_after[i]);
         max_active = std::max(max_active, active_count);
         if (progress && ((i + 1) % PROGRESS_INTERVAL == 0 || i + 1 == q)) {
             std::cerr << "DP: region contains " << region_ranks[i] << "/"
                       << model.height * model.width << " tiles; processed " << i + 1
                       << "/" << q << " chord candidates; " << comma_number(table.size())
-                      << " valid boundary states; boundary " << new_boundary.size()
+                      << " valid boundary states; boundary " << new_boundary_size
                       << " connectivity items + " << active_count << " factor bits; pruned "
                       << comma_number(dominated_total) << " dominated states; absorbed "
                       << comma_number(opening_absorptions) << " opening chains\n";
