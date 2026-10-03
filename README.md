@@ -328,7 +328,10 @@ layer, and DP states are held in a dense open-addressed table. Mine/3BV factors
 receive reusable slots for only the portion of the sweep in which they are
 live. When at most 64 slots are required, the complete factor state is stored
 and processed as one `uint64_t`; wider custom boards use a dynamically sized
-bitset fallback.
+bitset fallback. Future connectivity contacts likewise receive stable reusable
+boundary slots. Standard boards therefore store each unfinished component in
+one or two 64-bit words rather than a bitset spanning every chord candidate;
+boundaries requiring more than 128 slots use the general representation.
 
 The solver also applies exact dominance pruning:
 
@@ -346,9 +349,10 @@ evaluated lazily. Reaching the cap merely retains more states. It never removes
 a state without proof and therefore does not make the answer approximate.
 
 For `--order auto`, the program evaluates row, column, and promising banded
-orders and selects the one with the best structural frontier estimate. This is
-important for rectangular Expert boards, where sweep direction can have a large
-effect.
+orders in all four sweep directions: left-to-right, right-to-left,
+top-to-bottom, and bottom-to-top. It first minimizes estimated peak frontier
+width and then estimated total work. This is important for rectangular Expert
+boards, where sweep direction can have a large effect.
 
 ## Complexity and limitations
 
@@ -375,16 +379,16 @@ number of unfinished components, `D` the internal dominance-comparison limit,
 and `w = 64` the bitset word size. The main state storage is approximately
 
 ```text
-O(S * (ceil(f/w) + ceil(q/w)) + R * c * ceil(q/w)).
+O(S * (ceil(f/w) + ceil(q/w)) + R * c * ceil(b/w)).
 ```
 
 A conservative time bound for all `q` layers includes
 
 ```text
 O(q * (S*(f+q)/w
-       + R*c*log(c)*q/w
+       + R*c*log(c)*b/w
        + D*f/w
-       + R^2*(c^2*q/w + c^3))).
+       + R^2*(c^2*b/w + c^3))).
 ```
 
 This deliberately overstates typical behavior: connectivity transitions are

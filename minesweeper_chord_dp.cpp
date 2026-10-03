@@ -523,15 +523,21 @@ static Model ordered_model(const Model& model, const std::vector<int>& order) {
 }
 
 static std::vector<int> order_indices(const Model& model, const std::string& name,
-                                      int band_size = 1) {
+                                      int band_size = 1, bool reverse_lines = false) {
     if (band_size < 1) throw UserError("band size must be positive");
     std::vector<int> order(model.candidates.size());
     std::iota(order.begin(), order.end(), 0);
     auto key = [&](int i) {
         const int r = model.candidates[i] / model.width;
         const int c = model.candidates[i] % model.width;
-        if (name == "rows") return std::tuple<int, int, int>{r / band_size, c, r % band_size};
-        if (name == "columns") return std::tuple<int, int, int>{c / band_size, r, c % band_size};
+        if (name == "rows") {
+            const int line = reverse_lines ? model.height - 1 - r : r;
+            return std::tuple<int, int, int>{line / band_size, c, line % band_size};
+        }
+        if (name == "columns") {
+            const int line = reverse_lines ? model.width - 1 - c : c;
+            return std::tuple<int, int, int>{line / band_size, r, line % band_size};
+        }
         throw UserError("unknown order '" + name + "'");
     };
     std::sort(order.begin(), order.end(), [&](int a, int b) { return key(a) < key(b); });
@@ -608,7 +614,8 @@ static WidthEstimate width_estimate(const Model& model, const std::vector<int>& 
 // strip sweep.  A 16-row expert board has at most 16 candidates in a column,
 // so an exact subset DP over the possible partial-column cuts is inexpensive.
 static std::vector<int> smart_line_order_indices(const Model& model,
-                                                 const std::string& name) {
+                                                 const std::string& name,
+                                                 bool reverse_lines = false) {
     const bool by_columns = name == "columns";
     if (!by_columns && name != "rows") throw UserError("unknown smart order '" + name + "'");
     const int q = static_cast<int>(model.candidates.size());
@@ -620,6 +627,10 @@ static std::vector<int> smart_line_order_indices(const Model& model,
     auto secondary = [&](int candidate) {
         const int cell = model.candidates[candidate];
         return by_columns ? cell / model.width : cell % model.width;
+    };
+    auto sweep_line = [&](int candidate) {
+        const int line = primary(candidate);
+        return reverse_lines ? line_count - 1 - line : line;
     };
 
     std::vector<std::vector<int>> lines(line_count);
@@ -635,7 +646,8 @@ static std::vector<int> smart_line_order_indices(const Model& model,
     std::vector<int> result;
     result.reserve(q);
     for (int line_number = 0; line_number < line_count; ++line_number) {
-        const auto& line = lines[line_number];
+        const int physical_line = reverse_lines ? line_count - 1 - line_number : line_number;
+        const auto& line = lines[physical_line];
         const int p = static_cast<int>(line.size());
         if (p <= 1) {
             result.insert(result.end(), line.begin(), line.end());
@@ -667,7 +679,7 @@ static std::vector<int> smart_line_order_indices(const Model& model,
                 bool after = false;
                 uint32_t mask = 0;
                 for (int candidate : scope) {
-                    const int candidate_line = primary(candidate);
+                    const int candidate_line = sweep_line(candidate);
                     if (candidate_line < line_number) before = true;
                     else if (candidate_line > line_number) after = true;
                     else mask |= uint32_t{1} << local_bit[candidate];
@@ -717,11 +729,11 @@ static std::vector<int> smart_line_order_indices(const Model& model,
         int old_total = 0;
         int old_always = 0;
         for (int candidate = 0; candidate < q; ++candidate) {
-            if (primary(candidate) >= line_number) continue;
+            if (sweep_line(candidate) >= line_number) continue;
             bool later = false;
             uint32_t mask = 0;
             for (int neighbor : model.graph[candidate]) {
-                const int neighbor_line = primary(neighbor);
+                const int neighbor_line = sweep_line(neighbor);
                 if (neighbor_line > line_number) later = true;
                 else if (neighbor_line == line_number) {
                     mask |= uint32_t{1} << local_bit[neighbor];
@@ -744,7 +756,7 @@ static std::vector<int> smart_line_order_indices(const Model& model,
         std::vector<uint8_t> has_later_neighbor(p, 0);
         for (int bit = 0; bit < p; ++bit) {
             for (int neighbor : model.graph[line[bit]]) {
-                const int neighbor_line = primary(neighbor);
+                const int neighbor_line = sweep_line(neighbor);
                 if (neighbor_line > line_number) has_later_neighbor[bit] = 1;
                 else if (neighbor_line == line_number) {
                     same_line_neighbors[bit] |= uint32_t{1} << local_bit[neighbor];
@@ -838,45 +850,74 @@ static std::pair<Model, std::string> choose_order(const Model& model,
     std::vector<OrderChoice> choices;
     int standard_best = std::numeric_limits<int>::max();
     if (!band_size) {
-        std::vector<std::pair<std::string, WidthEstimate>> standard_estimates;
+        struct StandardEstimate {
+            std::string name;
+            bool reverse = false;
+            WidthEstimate estimate;
+        };
+        std::vector<StandardEstimate> standard_estimates;
         for (const std::string name : {"columns", "rows"}) {
-            auto order = order_indices(model, name, 1);
-            auto estimate = width_estimate(model, order);
-            standard_best = std::min(standard_best, std::get<0>(estimate));
-            choices.push_back({estimate, name, std::move(order)});
-            standard_estimates.emplace_back(name, estimate);
+            for (bool reverse : {false, true}) {
+                auto order = order_indices(model, name, 1, reverse);
+                auto estimate = width_estimate(model, order);
+                standard_best = std::min(standard_best, std::get<0>(estimate));
+                const std::string label = name + (reverse ? "-reverse" : "");
+                choices.push_back({estimate, label, std::move(order)});
+                standard_estimates.push_back({name, reverse, estimate});
+            }
         }
-        for (const auto& [name, standard_estimate] : standard_estimates) {
+        for (const auto& standard : standard_estimates) {
+            const auto& name = standard.name;
             const int physical_line_size = name == "columns" ? model.height : model.width;
             // Do not spend 2^p preprocessing time on the long-axis sweep, or
             // on an orientation whose ordinary estimate is already clearly
             // inferior.  Explicit rows-smart/columns-smart remains available.
             if (physical_line_size > 20 ||
-                std::get<0>(standard_estimate) > standard_best + 2) continue;
-            auto smart_order = smart_line_order_indices(model, name);
+                std::get<0>(standard.estimate) > standard_best + 2) continue;
+            auto smart_order = smart_line_order_indices(model, name, standard.reverse);
             auto smart_estimate = width_estimate(model, smart_order);
-            choices.push_back({smart_estimate, name + "-smart", std::move(smart_order)});
+            const std::string label = name + (standard.reverse ? "-reverse" : "") + "-smart";
+            choices.push_back({smart_estimate, label, std::move(smart_order)});
         }
     }
-    std::vector<std::pair<std::string, int>> candidates;
+    struct BandCandidate {
+        std::string name;
+        int size = 1;
+        bool reverse = false;
+    };
+    std::vector<BandCandidate> candidates;
     if (band_size) {
-        candidates.emplace_back("columns", *band_size);
-        candidates.emplace_back("rows", *band_size);
+        candidates.push_back({"columns", *band_size, false});
+        candidates.push_back({"columns", *band_size, true});
+        candidates.push_back({"rows", *band_size, false});
+        candidates.push_back({"rows", *band_size, true});
     } else {
         auto row_sizes = candidate_band_sizes(model.height);
         auto column_sizes = candidate_band_sizes(model.width);
-        for (size_t i = 1; i < row_sizes.size(); ++i) candidates.emplace_back("rows", row_sizes[i]);
-        for (size_t i = 1; i < column_sizes.size(); ++i) candidates.emplace_back("columns", column_sizes[i]);
+        for (size_t i = 1; i < row_sizes.size(); ++i) {
+            candidates.push_back({"rows", row_sizes[i], false});
+            candidates.push_back({"rows", row_sizes[i], true});
+        }
+        for (size_t i = 1; i < column_sizes.size(); ++i) {
+            candidates.push_back({"columns", column_sizes[i], false});
+            candidates.push_back({"columns", column_sizes[i], true});
+        }
     }
-    for (const auto& [name, size] : candidates) {
-        auto order = order_indices(model, name, size);
+    for (const auto& candidate : candidates) {
+        auto order = order_indices(model, candidate.name, candidate.size, candidate.reverse);
         auto estimate = width_estimate(model, order);
         if (band_size || std::get<0>(estimate) <= standard_best - 2) {
-            choices.push_back({estimate, name + "-band-" + std::to_string(size), std::move(order)});
+            const std::string label = candidate.name +
+                (candidate.reverse ? "-reverse" : "") +
+                "-band-" + std::to_string(candidate.size);
+            choices.push_back({estimate, label, std::move(order)});
         }
     }
     auto best = std::min_element(choices.begin(), choices.end(), [](const auto& a, const auto& b) {
-        return std::tie(a.estimate, a.name) < std::tie(b.estimate, b.name);
+        return std::tuple<int, uint64_t, std::string>{
+                   std::get<0>(a.estimate), std::get<3>(a.estimate), a.name} <
+               std::tuple<int, uint64_t, std::string>{
+                   std::get<0>(b.estimate), std::get<3>(b.estimate), b.name};
     });
     return {ordered_model(model, best->order), best->name};
 }
@@ -1649,6 +1690,7 @@ static size_t prune_dominated(FactorTable<FactorBits>& table,
 
 static std::vector<int> ordered_region_ranks(const Model& model, const std::string& order_name) {
     const bool rows = order_name.rfind("rows", 0) == 0;
+    const bool reverse = order_name.find("-reverse") != std::string::npos;
     int band = 1;
     const size_t marker = order_name.rfind("-band-");
     if (marker != std::string::npos) band = std::stoi(order_name.substr(marker + 6));
@@ -1657,8 +1699,12 @@ static std::vector<int> ordered_region_ranks(const Model& model, const std::stri
     auto key = [&](int cell) {
         const int r = cell / model.width;
         const int c = cell % model.width;
-        if (rows) return std::tuple<int, int, int>{r / band, c, r % band};
-        return std::tuple<int, int, int>{c / band, r, c % band};
+        if (rows) {
+            const int line = reverse ? model.height - 1 - r : r;
+            return std::tuple<int, int, int>{line / band, c, line % band};
+        }
+        const int line = reverse ? model.width - 1 - c : c;
+        return std::tuple<int, int, int>{line / band, r, line % band};
     };
     std::sort(cells.begin(), cells.end(), [&](int a, int b) { return key(a) < key(b); });
     std::vector<int> rank(cells.size());
@@ -1786,6 +1832,58 @@ static Solution solve_frontier_core(const Model& original_model,
             }
         }
     }
+    // Give each candidate a stable slot for the cuts where it can be reached
+    // from the processed region. A slot can be reused at the transition that
+    // processes its previous owner because that owner's bit is explicitly
+    // removed before the outgoing signature is interned.
+    std::vector<int> first_contact(q, q);
+    for (int i = 0; i < q; ++i) {
+        for (int candidate = i + 1; candidate < q; ++candidate) {
+            if (test_bit(future_neighbors[i], candidate)) {
+                first_contact[candidate] = std::min(first_contact[candidate], i);
+            }
+        }
+    }
+    std::vector<int> contact_order;
+    for (int candidate = 0; candidate < q; ++candidate) {
+        if (first_contact[candidate] < q) contact_order.push_back(candidate);
+    }
+    std::sort(contact_order.begin(), contact_order.end(), [&](int a, int b) {
+        return std::pair<int, int>{first_contact[a], a} <
+               std::pair<int, int>{first_contact[b], b};
+    });
+    std::vector<int> connectivity_slot(q, -1);
+    std::vector<int> connectivity_slot_last;
+    for (int candidate : contact_order) {
+        int chosen = -1;
+        for (int slot = 0; slot < static_cast<int>(connectivity_slot_last.size()); ++slot) {
+            if (connectivity_slot_last[slot] <= first_contact[candidate]) {
+                chosen = slot;
+                break;
+            }
+        }
+        if (chosen < 0) {
+            chosen = static_cast<int>(connectivity_slot_last.size());
+            connectivity_slot_last.push_back(candidate);
+        } else {
+            connectivity_slot_last[chosen] = candidate;
+        }
+        connectivity_slot[candidate] = chosen;
+    }
+    const bool compact_connectivity = connectivity_slot_last.size() <= 128;
+    const size_t compact_signature_words =
+        std::max<size_t>(1, (connectivity_slot_last.size() + 63) / 64);
+    std::vector<std::vector<uint64_t>> compact_future_neighbors;
+    if (compact_connectivity) {
+        compact_future_neighbors.assign(q, std::vector<uint64_t>(compact_signature_words, 0));
+        for (int i = 0; i < q; ++i) {
+            for (int candidate = i + 1; candidate < q; ++candidate) {
+                if (!test_bit(future_neighbors[i], candidate)) continue;
+                const int slot = connectivity_slot[candidate];
+                compact_future_neighbors[i][slot / 64] |= uint64_t{1} << (slot % 64);
+            }
+        }
+    }
     std::vector<int> last_future(q);
     for (int i = 0; i < q; ++i) {
         last_future[i] = i;
@@ -1814,6 +1912,10 @@ static Solution solve_frontier_core(const Model& original_model,
 
     for (int i = 0; i < q; ++i) {
         const auto& new_boundary = boundaries[i + 1];
+        const size_t signature_words = compact_connectivity
+            ? compact_signature_words : chosen_words;
+        const int current_connectivity_slot = compact_connectivity
+            ? connectivity_slot[i] : i;
 
         TableType next;
         const size_t desired_capacity = table.size() > (std::numeric_limits<size_t>::max() - 16) / 2
@@ -1829,7 +1931,8 @@ static Solution solve_frontier_core(const Model& original_model,
             // grows, unlike pointers into a vector.
             std::vector<uint64_t> outgoing_words;
             std::vector<size_t> outgoing_offsets;
-            std::vector<uint64_t> merged(chosen_words);
+            std::vector<uint64_t> merged(signature_words);
+            std::vector<uint64_t> projected(signature_words);
             std::vector<uint64_t> canonical;
             for (const auto& [old_state, old_record] : table) {
                 if (!connectivity_ready[old_state.connectivity_id]) {
@@ -1840,32 +1943,41 @@ static Solution solve_frontier_core(const Model& original_model,
                         outgoing_words.clear();
                         outgoing_offsets.clear();
                         std::fill(merged.begin(), merged.end(), 0);
-                        outgoing_words.reserve(old_signature.size() +
-                                               selected * chosen_words);
-                        outgoing_offsets.reserve(old_signature.size() / chosen_words +
-                                                 selected);
+                        const size_t old_component_count =
+                            old_signature.size() / signature_words;
+                        outgoing_words.reserve(
+                            (old_component_count + selected) * signature_words);
+                        outgoing_offsets.reserve(old_component_count + selected);
                         if (selected) {
-                            for (size_t word = 0; word < chosen_words; ++word) {
-                                merged[word] = future_neighbors[i][word];
+                            if (compact_connectivity) {
+                                merged = compact_future_neighbors[i];
+                            } else {
+                                for (size_t word = 0; word < chosen_words; ++word) {
+                                    merged[word] = future_neighbors[i][word];
+                                }
                             }
                         }
                         for (size_t offset = 0; offset < old_signature.size();
-                             offset += chosen_words) {
-                            const bool touches =
-                                (old_signature[offset + i / 64] >> (i % 64)) & 1U;
+                             offset += signature_words) {
+                            const bool touches = current_connectivity_slot >= 0 &&
+                                ((old_signature[offset + current_connectivity_slot / 64] >>
+                                  (current_connectivity_slot % 64)) & 1U);
+                            for (size_t word = 0; word < signature_words; ++word) {
+                                projected[word] = old_signature[offset + word];
+                            }
+                            if (current_connectivity_slot >= 0) {
+                                projected[current_connectivity_slot / 64] &=
+                                    ~(uint64_t{1} << (current_connectivity_slot % 64));
+                            }
                             if (selected && touches) {
-                                for (size_t word = 0; word < chosen_words; ++word) {
-                                    merged[word] |= old_signature[offset + word];
+                                for (size_t word = 0; word < signature_words; ++word) {
+                                    merged[word] |= projected[word];
                                 }
                                 continue;
                             }
                             const size_t start = outgoing_words.size();
                             bool nonempty = false;
-                            for (size_t word = 0; word < chosen_words; ++word) {
-                                uint64_t value = old_signature[offset + word];
-                                if (word == static_cast<size_t>(i / 64)) {
-                                    value &= ~(uint64_t{1} << (i % 64));
-                                }
+                            for (uint64_t value : projected) {
                                 outgoing_words.push_back(value);
                                 nonempty = nonempty || value != 0;
                             }
@@ -1876,7 +1988,6 @@ static Solution solve_frontier_core(const Model& original_model,
                             }
                         }
                         if (selected) {
-                            merged[i / 64] &= ~(uint64_t{1} << (i % 64));
                             const bool nonempty = std::any_of(
                                 merged.begin(), merged.end(),
                                 [](uint64_t word) { return word != 0; });
@@ -1888,7 +1999,7 @@ static Solution solve_frontier_core(const Model& original_model,
                         }
                         std::sort(outgoing_offsets.begin(), outgoing_offsets.end(),
                                   [&](size_t a, size_t b) {
-                                      for (size_t word = 0; word < chosen_words; ++word) {
+                                      for (size_t word = 0; word < signature_words; ++word) {
                                           if (outgoing_words[a + word] !=
                                               outgoing_words[b + word]) {
                                               return outgoing_words[a + word] <
@@ -1898,13 +2009,14 @@ static Solution solve_frontier_core(const Model& original_model,
                                       return false;
                                   });
                         canonical.clear();
-                        canonical.reserve(outgoing_offsets.size() * chosen_words);
+                        canonical.reserve(outgoing_offsets.size() * signature_words);
                         for (size_t offset : outgoing_offsets) {
                             canonical.insert(canonical.end(),
                                              outgoing_words.begin() +
                                                  static_cast<std::ptrdiff_t>(offset),
                                              outgoing_words.begin() +
-                                                 static_cast<std::ptrdiff_t>(offset + chosen_words));
+                                                 static_cast<std::ptrdiff_t>(
+                                                     offset + signature_words));
                         }
                         computed[selected] = {next_connectivity_pool.intern(canonical),
                                               closed};
@@ -1956,7 +2068,7 @@ static Solution solve_frontier_core(const Model& original_model,
 
         const size_t removed = prune_dominated(
             next, DOMINANCE_COMPARISONS, base_after[i],
-            next_connectivity_pool, chosen_words);
+            next_connectivity_pool, signature_words);
         table = std::move(next);
         connectivity_pool.swap(next_connectivity_pool);
         dominated_total += removed;
