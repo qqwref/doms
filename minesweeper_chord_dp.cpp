@@ -79,6 +79,22 @@ struct Action {
     int cell;
 };
 
+struct ProfileStats {
+    double model = 0.0;
+    double ordering = 0.0;
+    double factor_plan = 0.0;
+    double dp_setup = 0.0;
+    double transitions = 0.0;
+    double dominance = 0.0;
+    double replay = 0.0;
+    double dominance_setup = 0.0;
+    double dominance_exact = 0.0;
+    double dominance_cross = 0.0;
+    double dominance_erase = 0.0;
+    uint64_t processed_states = 0;
+    uint64_t generated_states = 0;
+};
+
 struct Solution {
     int clicks = 0;
     bool count_only = false;
@@ -98,6 +114,7 @@ struct Solution {
     double reduction_seconds = 0.0;
     std::string order_name;
     double solve_seconds = 0.0;
+    ProfileStats profile;
 };
 
 static std::vector<int> neighbors(int cell, int height, int width) {
@@ -1359,11 +1376,11 @@ static std::pair<Model, std::string> choose_order(const Model& model,
     return {ordered_model(model, best->order), best->name};
 }
 
-// Most standard-board states need at most four words. Keeping those words in
-// the object avoids millions of tiny heap allocations in the DP hash tables.
+// Six words cover chosen-chord histories on standard boards and most 30x20
+// boards. Keeping them inline avoids millions of allocations in replay mode.
 class Bits {
 public:
-    static constexpr size_t INLINE_WORDS = 4;
+    static constexpr size_t INLINE_WORDS = 6;
 
     Bits() = default;
     explicit Bits(size_t count) : size_(count) {
@@ -1920,8 +1937,11 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                               uint64_t comparison_limit,
                               const FactorBits& base_mask,
                               const ConnectivityPool& connectivity_pool,
-                              size_t signature_words) {
+                              size_t signature_words,
+                              ProfileStats* profile = nullptr) {
     if (comparison_limit == 0 || table.size() < 2) return 0;
+    const auto profile_start = profile ? std::chrono::steady_clock::now() :
+        std::chrono::steady_clock::time_point{};
     using Item = typename FactorTable<FactorBits, TrackChosen>::iterator;
     struct CachedItem {
         Item item;
@@ -2042,6 +2062,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
 
     // First remove factor-dominated states with identical connectivity. The
     // per-ID survivor lists inherit the bucket's cached sort order.
+    const auto setup_end = profile ? std::chrono::steady_clock::now() : profile_start;
     for (auto& bucket : buckets) {
         for (CachedItem& cached : bucket.entries) {
             const uint32_t connectivity_id = cached.item->first.connectivity_id;
@@ -2066,6 +2087,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             }
         }
     }
+    const auto exact_end = profile ? std::chrono::steady_clock::now() : setup_end;
 
     std::vector<size_t> component_counts(connectivity_count, 0);
     std::vector<std::vector<int>> component_populations(connectivity_count);
@@ -2181,6 +2203,7 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             if (exhausted) break;
         }
     }
+    const auto cross_end = profile ? std::chrono::steady_clock::now() : exact_end;
 
     size_t removed = 0;
     for (auto& bucket : buckets) {
@@ -2189,6 +2212,13 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             table.erase(cached.item);
             ++removed;
         }
+    }
+    if (profile) {
+        const auto erase_end = std::chrono::steady_clock::now();
+        profile->dominance_setup += std::chrono::duration<double>(setup_end - profile_start).count();
+        profile->dominance_exact += std::chrono::duration<double>(exact_end - setup_end).count();
+        profile->dominance_cross += std::chrono::duration<double>(cross_end - exact_end).count();
+        profile->dominance_erase += std::chrono::duration<double>(erase_end - cross_end).count();
     }
     return removed;
 }
@@ -2327,7 +2357,11 @@ static Solution solve_frontier_core(const Model& original_model,
                                     const Model& model,
                                     const std::string& order_name,
                                     const FactorPlan& factors,
-                                    bool progress) {
+                                    bool progress,
+                                    bool profile_enabled) {
+    const auto core_start = profile_enabled ? std::chrono::steady_clock::now() :
+        std::chrono::steady_clock::time_point{};
+    ProfileStats profile;
     using Ops = FactorOps<FactorBits>;
     using StateType = FactorState<FactorBits>;
     using TableType = FactorTable<FactorBits, TrackChosen>;
@@ -2481,7 +2515,9 @@ static Solution solve_frontier_core(const Model& original_model,
     size_t dominated_total = 0;
     size_t opening_absorptions = 0;
 
+    const auto loop_start = profile_enabled ? std::chrono::steady_clock::now() : core_start;
     for (int i = 0; i < q; ++i) {
+        if (profile_enabled) profile.processed_states += table.size();
         boundary_size += boundary_delta[i];
         const int new_boundary_size = boundary_size;
         const size_t signature_words = compact_connectivity
@@ -2690,9 +2726,16 @@ static Solution solve_frontier_core(const Model& original_model,
             connectivity_pool.swap(released);
         }
 
+        if (profile_enabled) profile.generated_states += next.size();
+        const auto prune_start = profile_enabled ? std::chrono::steady_clock::now() : loop_start;
         const size_t removed = prune_dominated(
             next, DOMINANCE_COMPARISONS, base_after[i],
-            next_connectivity_pool, signature_words);
+            next_connectivity_pool, signature_words,
+            profile_enabled ? &profile : nullptr);
+        if (profile_enabled) {
+            profile.dominance += std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - prune_start).count();
+        }
         table = std::move(next);
         connectivity_pool.swap(next_connectivity_pool);
         dominated_total += removed;
@@ -2711,10 +2754,17 @@ static Solution solve_frontier_core(const Model& original_model,
         }
     }
 
+    const auto loop_end = profile_enabled ? std::chrono::steady_clock::now() : loop_start;
+    if (profile_enabled) {
+        profile.dp_setup = std::chrono::duration<double>(loop_start - core_start).count();
+        profile.transitions = std::chrono::duration<double>(loop_end - loop_start).count()
+            - profile.dominance;
+    }
     StateType final_state{0, zero_factors};
     auto final = table.find(final_state);
     if (final == table.end()) throw std::logic_error("frontier DP did not reach an empty final state");
     Solution solution;
+    const auto replay_start = profile_enabled ? std::chrono::steady_clock::now() : loop_end;
     if constexpr (TrackChosen) {
         std::vector<int> selected;
         selected.reserve(q);
@@ -2729,6 +2779,11 @@ static Solution solve_frontier_core(const Model& original_model,
         solution.clicks = final->second.cost;
         solution.count_only = true;
     }
+    if (profile_enabled) {
+        profile.replay = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - replay_start).count();
+        solution.profile = profile;
+    }
     solution.peak_states = peak_states;
     solution.max_boundary_vertices = max_boundary;
     solution.max_active_factors = max_active;
@@ -2741,22 +2796,31 @@ static Solution solve_frontier(const Model& original_model,
                                const std::string& requested_order,
                                std::optional<int> band_size,
                                bool progress,
-                               bool count_only = false) {
+                               bool count_only = false,
+                               bool profile_enabled = false) {
     CandidateReduction reduction = reduce_candidates(original_model, progress);
+    const auto ordering_start = profile_enabled ? std::chrono::steady_clock::now() :
+        std::chrono::steady_clock::time_point{};
     auto [model, order_name] = choose_order(
         reduction.model, requested_order, band_size);
+    const auto factor_start = profile_enabled ? std::chrono::steady_clock::now() : ordering_start;
     const FactorPlan factors = make_factor_plan(model);
+    const auto dp_start = profile_enabled ? std::chrono::steady_clock::now() : factor_start;
     Solution solution;
     if (factors.slot_count <= 64) {
         if (count_only) solution = solve_frontier_core<uint64_t, false>(
-            original_model, model, order_name, factors, progress);
+            original_model, model, order_name, factors, progress, profile_enabled);
         else solution = solve_frontier_core<uint64_t, true>(
-            original_model, model, order_name, factors, progress);
+            original_model, model, order_name, factors, progress, profile_enabled);
     } else {
         if (count_only) solution = solve_frontier_core<Bits, false>(
-            original_model, model, order_name, factors, progress);
+            original_model, model, order_name, factors, progress, profile_enabled);
         else solution = solve_frontier_core<Bits, true>(
-            original_model, model, order_name, factors, progress);
+            original_model, model, order_name, factors, progress, profile_enabled);
+    }
+    if (profile_enabled) {
+        solution.profile.ordering = std::chrono::duration<double>(factor_start - ordering_start).count();
+        solution.profile.factor_plan = std::chrono::duration<double>(dp_start - factor_start).count();
     }
     solution.candidate_chords_before_reduction =
         static_cast<int>(original_model.candidates.size());
@@ -3112,6 +3176,7 @@ struct Options {
     std::string order = "auto";
     std::optional<int> band_size;
     bool progress = false;
+    bool profile = false;
     bool json = false;
     bool click_tuples = false;
 };
@@ -3134,6 +3199,7 @@ static void print_help(const char* program) {
         << "  --order auto|rows|columns|rows-smart|columns-smart\n"
         << "  --band-size N\n"
         << "  --progress\n"
+        << "  --profile                    Print a timing breakdown on single boards\n"
         << "  --json\n"
         << "  --click-tuples\n"
         << "  -h, --help\n";
@@ -3190,6 +3256,7 @@ static Options parse_options(int argc, char** argv) {
         else if (arg == "--order") options.order = value_after(i, arg);
         else if (arg == "--band-size") options.band_size = parse_positive_int(value_after(i, arg), arg);
         else if (arg == "--progress") options.progress = true;
+        else if (arg == "--profile") options.profile = true;
         else if (arg == "--json") options.json = true;
         else if (arg == "--click-tuples") options.click_tuples = true;
         else if (!arg.empty() && arg.front() == '-') throw UserError("unknown option: " + arg);
@@ -3204,6 +3271,7 @@ static Options parse_options(int argc, char** argv) {
         throw UserError("choose only one of --generate and --bulk");
     }
     if (options.bulk) {
+        if (options.profile) throw UserError("--profile is for single boards only");
         if (!valid_difficulty(*options.bulk)) {
             throw UserError("--bulk must be beginner, intermediate, or expert");
         }
@@ -3327,11 +3395,33 @@ int main(int argc, char** argv) {
 
         const auto start = std::chrono::steady_clock::now();
         Model model = build_model(board);
+        const auto model_end = options.profile ? std::chrono::steady_clock::now() : start;
         Solution solution = solve_frontier(
             model, options.order, options.band_size, options.progress,
-            options.count_only.value_or(false));
+            options.count_only.value_or(false), options.profile);
         const auto end = std::chrono::steady_clock::now();
         solution.solve_seconds = std::chrono::duration<double>(end - start).count();
+        if (options.profile) {
+            auto& p = solution.profile;
+            p.model = std::chrono::duration<double>(model_end - start).count();
+            std::cerr << std::fixed << std::setprecision(3)
+                      << "Profile: model " << p.model << " s; candidate reduction "
+                      << solution.reduction_seconds << " s; ordering " << p.ordering
+                      << " s; factor plan " << p.factor_plan << " s\n"
+                      << "Profile: DP setup " << p.dp_setup << " s; transitions "
+                      << p.transitions << " s; dominance " << p.dominance
+                      << " s; move reconstruction " << p.replay << " s\n"
+                      << "Profile: dominance detail: setup " << p.dominance_setup
+                      << " s; same-connectivity " << p.dominance_exact
+                      << " s; cross-connectivity " << p.dominance_cross
+                      << " s; erasure " << p.dominance_erase
+                      << " s; cleanup/other " << std::max(0.0, p.dominance -
+                          p.dominance_setup - p.dominance_exact -
+                          p.dominance_cross - p.dominance_erase) << " s\n"
+                      << "Profile: processed " << comma_number(p.processed_states)
+                      << " states; generated " << comma_number(p.generated_states)
+                      << " pre-pruning states\n";
+        }
         std::cerr << "Solve time: " << std::fixed << std::setprecision(3)
                   << solution.solve_seconds << " seconds\n";
 
