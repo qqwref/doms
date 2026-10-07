@@ -1343,12 +1343,17 @@ static std::pair<Model, std::string> choose_order(const Model& model,
             }
         }
     }
+    // Connectivity signatures grow substantially faster than factor-hit masks.
+    // A one-item increase in total width can therefore be a worthwhile trade
+    // for a narrower connectivity frontier; use both widths to rank sweeps.
     auto best = std::min_element(choices.begin(), choices.end(), [](const auto& a, const auto& b) {
         return std::tuple<int, int, uint64_t, std::string>{
-                   std::get<0>(a.estimate), std::get<1>(a.estimate),
+                   std::get<0>(a.estimate) + std::get<1>(a.estimate),
+                   std::get<0>(a.estimate),
                    std::get<3>(a.estimate), a.name} <
                std::tuple<int, int, uint64_t, std::string>{
-                   std::get<0>(b.estimate), std::get<1>(b.estimate),
+                   std::get<0>(b.estimate) + std::get<1>(b.estimate),
+                   std::get<0>(b.estimate),
                    std::get<3>(b.estimate), b.name};
     });
     return {ordered_model(model, best->order), best->name};
@@ -1930,6 +1935,9 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
     struct Bucket {
         std::vector<uint32_t> connectivity_ids;
         std::vector<CachedItem> entries;
+        // If two future boundary positions occur together in a fine component,
+        // a coarsening must contain them together in some component too.
+        std::unordered_map<uint16_t, std::vector<uint32_t>> pair_postings;
     };
 
     const size_t connectivity_count = connectivity_pool.size();
@@ -1965,6 +1973,29 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
     for (uint32_t id = 0; id < connectivity_count; ++id) {
         if (state_counts[id] != 0) {
             bucket_state_counts[connectivity_bucket[id]] += state_counts[id];
+        }
+    }
+    if (signature_words == 1) {
+        for (auto& bucket : buckets) {
+            if (bucket.connectivity_ids.size() < 64) continue;
+            for (uint32_t id : bucket.connectivity_ids) {
+                for (uint64_t component : connectivity_pool[id]) {
+                    for (uint64_t outer = component; outer; outer &= outer - 1) {
+                        const int a = __builtin_ctzll(outer);
+                        uint64_t inner = outer & (outer - 1);
+                        while (inner) {
+                            const int b = __builtin_ctzll(inner);
+                            inner &= inner - 1;
+                            bucket.pair_postings[static_cast<uint16_t>((a << 6) | b)]
+                                .push_back(id);
+                        }
+                    }
+                }
+            }
+            for (auto& posting : bucket.pair_postings) {
+                auto& ids = posting.second;
+                ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+            }
         }
     }
     for (size_t bucket = 0; bucket < buckets.size(); ++bucket) {
@@ -2071,10 +2102,28 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
     for (uint32_t fine_id = 0; fine_id < connectivity_count && !exhausted; ++fine_id) {
         if (survivors[fine_id].empty()) continue;
         coarser.clear();
-        const auto& candidate_ids =
-            buckets[connectivity_bucket[fine_id]].connectivity_ids;
-        coarser.reserve(candidate_ids.size());
-        for (uint32_t coarse_id : candidate_ids) {
+        const auto& bucket = buckets[connectivity_bucket[fine_id]];
+        const std::vector<uint32_t>* candidate_ids = &bucket.connectivity_ids;
+        if (!bucket.pair_postings.empty()) {
+            for (uint64_t component : connectivity_pool[fine_id]) {
+                for (uint64_t outer = component; outer; outer &= outer - 1) {
+                    const int a = __builtin_ctzll(outer);
+                    uint64_t inner = outer & (outer - 1);
+                    while (inner) {
+                        const int b = __builtin_ctzll(inner);
+                        inner &= inner - 1;
+                        auto posting = bucket.pair_postings.find(
+                            static_cast<uint16_t>((a << 6) | b));
+                        if (posting != bucket.pair_postings.end() &&
+                            posting->second.size() < candidate_ids->size()) {
+                            candidate_ids = &posting->second;
+                        }
+                    }
+                }
+            }
+        }
+        coarser.reserve(candidate_ids->size());
+        for (uint32_t coarse_id : *candidate_ids) {
             if (coarse_id == fine_id || survivors[coarse_id].empty()) continue;
             if (component_counts[coarse_id] > component_counts[fine_id]) continue;
             if (maximum_component_population[fine_id] >
