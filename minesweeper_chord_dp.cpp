@@ -32,6 +32,16 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 namespace fs = std::filesystem;
 
 constexpr std::string_view LLAMA_ALPHABET = "0123456789abcdefghijklmnopqrstuv";
@@ -250,7 +260,16 @@ static std::string format_pttacg_string(const Board& board) {
     if (board.height == 9 && board.width == 9) code = "1";
     else if (board.height == 16 && board.width == 16) code = "2";
     else if (board.height == 16 && board.width == 30) code = "3";
-    else throw UserError("PTTACG output supports only standard dimensions");
+    else {
+        code = std::to_string(board.width) +
+               std::to_string(board.height).insert(0,
+                   std::max(0, static_cast<int>(std::to_string(board.width).size()) -
+                                  static_cast<int>(std::to_string(board.height).size())), '0');
+        const auto dimensions = llama_dimensions(code, (board.mines.size() + 4) / 5);
+        if (dimensions != std::pair<int, int>{board.height, board.width}) {
+            throw UserError("board dimensions cannot be encoded unambiguously as PTTACG");
+        }
+    }
     std::string mine_code;
     for (size_t start = 0; start < board.mines.size(); start += 5) {
         unsigned value = 0;
@@ -338,7 +357,209 @@ static std::string read_file_text(const fs::path& path) {
     return std::string(std::istreambuf_iterator<char>(input), {});
 }
 
+static bool is_world_game_url(const std::string& source) {
+    static const std::regex url(R"(^https://(?:www\.)?minesweeper\.online/game/[0-9]+/?$)",
+                                std::regex::icase);
+    return std::regex_match(source, url);
+}
+
+static fs::path world_browser_path() {
+    if (const char* specified = std::getenv("DOMS_BROWSER")) {
+        if (fs::is_regular_file(specified)) return fs::absolute(specified);
+        throw UserError("DOMS_BROWSER must name an installed Chrome, Edge, or Chromium executable");
+    }
+    std::vector<fs::path> candidates;
+#ifdef _WIN32
+    for (const char* variable : {"PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"}) {
+        if (const char* root = std::getenv(variable)) {
+            candidates.push_back(fs::path(root) / "Google/Chrome/Application/chrome.exe");
+            candidates.push_back(fs::path(root) / "Microsoft/Edge/Application/msedge.exe");
+        }
+    }
+    const std::vector<std::string> names = {"chrome.exe", "msedge.exe"};
+    constexpr char separator = ';';
+#elif defined(__APPLE__)
+    candidates.push_back("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+    candidates.push_back("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge");
+    const std::vector<std::string> names = {"google-chrome", "chromium", "microsoft-edge"};
+    constexpr char separator = ':';
+#else
+    const std::vector<std::string> names = {"google-chrome", "chromium", "chromium-browser",
+                                            "microsoft-edge"};
+    constexpr char separator = ':';
+#endif
+    if (const char* env_path = std::getenv("PATH")) {
+        std::istringstream directories(env_path);
+        std::string directory;
+        while (std::getline(directories, directory, separator)) {
+            for (const auto& name : names) candidates.push_back(fs::path(directory) / name);
+        }
+    }
+    for (const auto& candidate : candidates) {
+        if (fs::is_regular_file(candidate)) return fs::absolute(candidate);
+    }
+    throw UserError("World of Minesweeper import needs Chrome, Edge, or Chromium; "
+                    "set DOMS_BROWSER to its executable path if it is not found");
+}
+
+static std::string world_game_dom(const std::string& url) {
+    const fs::path browser = world_browser_path();
+    const auto nonce = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    const fs::path temporary = fs::temp_directory_path() / ("doms-world-" + nonce);
+    if (!fs::create_directory(temporary)) throw UserError("cannot create browser work directory");
+    struct RemoveDirectory {
+        fs::path path;
+        ~RemoveDirectory() { std::error_code error; fs::remove_all(path, error); }
+    } cleanup{temporary};
+    const fs::path output = temporary / "dom.html";
+#ifdef _WIN32
+    SECURITY_ATTRIBUTES inheritable{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    const HANDLE file = CreateFileW(output.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                                    &inheritable, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) throw UserError("cannot capture browser output");
+    const HANDLE errors = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &inheritable,
+                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const HANDLE input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ, &inheritable,
+                                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (errors == INVALID_HANDLE_VALUE || input == INVALID_HANDLE_VALUE) {
+        CloseHandle(file);
+        if (errors != INVALID_HANDLE_VALUE) CloseHandle(errors);
+        if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
+        throw UserError("cannot configure headless browser output");
+    }
+    STARTUPINFOW startup{};
+    startup.cb = sizeof startup;
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = input;
+    startup.hStdOutput = file;
+    startup.hStdError = errors;
+    PROCESS_INFORMATION process{};
+    std::wstring command = L"\"" + browser.wstring() + L"\" --headless=new --dump-dom "
+        L"--timeout=45000 --virtual-time-budget=45000 --no-first-run "
+        L"\"--user-data-dir=" + temporary.wstring() + L"\" \"" +
+        std::wstring(url.begin(), url.end()) + L"\"";
+    const BOOL started = CreateProcessW(browser.c_str(), command.data(), nullptr,
+                                        nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
+                                        &startup, &process);
+    CloseHandle(file);
+    CloseHandle(errors);
+    CloseHandle(input);
+    if (!started) throw UserError("could not launch headless browser");
+    const DWORD wait = WaitForSingleObject(process.hProcess, 65000);
+    if (wait == WAIT_TIMEOUT) TerminateProcess(process.hProcess, 1);
+    DWORD exit_code = 1;
+    GetExitCodeProcess(process.hProcess, &exit_code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    if (wait != WAIT_OBJECT_0 || exit_code != 0) {
+        throw UserError("headless browser did not finish loading the World of Minesweeper game");
+    }
+#else
+    const std::string profile = "--user-data-dir=" + temporary.string();
+    const pid_t process = fork();
+    if (process < 0) throw UserError("could not start headless browser");
+    if (process == 0) {
+        const int file = open(output.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        const int errors = open("/dev/null", O_WRONLY);
+        if (file < 0 || errors < 0) _exit(127);
+        dup2(file, STDOUT_FILENO);
+        dup2(errors, STDERR_FILENO);
+        close(file);
+        close(errors);
+        execl(browser.c_str(), browser.c_str(), "--headless=new", "--dump-dom",
+              "--timeout=45000", "--virtual-time-budget=45000", "--no-first-run",
+              profile.c_str(), url.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    int status = 0;
+    bool finished = false;
+    for (int i = 0; i < 650; ++i) {
+        if (waitpid(process, &status, WNOHANG) == process) { finished = true; break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (!finished) { kill(process, SIGKILL); waitpid(process, &status, 0); }
+    if (!finished || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        throw UserError("headless browser did not finish loading the World of Minesweeper game");
+    }
+#endif
+    std::error_code error;
+    if (!fs::is_regular_file(output, error) || fs::file_size(output, error) > 20'000'000) {
+        throw UserError("headless browser returned no usable game DOM");
+    }
+    return read_file_text(output);
+}
+
+static Board parse_world_game_dom(const std::string& html) {
+    static const std::regex tag_re(R"(<div\b[^>]*>)", std::regex::icase);
+    static const std::regex id_re(R"re(\bid="cell_([0-9]+)_([0-9]+)")re");
+    static const std::regex face_re(R"re(\bid="top_area_face")re");
+    static const std::regex class_re(R"re(\bclass="([^"]*)")re");
+    static const std::regex number_re(R"((?:hd|hdd)_type([0-8])(?:\s|$))");
+    struct Cell { int x, y, number; bool mine; };
+    std::vector<Cell> cells;
+    int max_x = -1, max_y = -1;
+    bool won = false;
+    bool lost = false;
+    for (auto it = std::sregex_iterator(html.begin(), html.end(), tag_re);
+         it != std::sregex_iterator(); ++it) {
+        const std::string tag = it->str();
+        std::smatch id, classes;
+        if (std::regex_search(tag, face_re) && std::regex_search(tag, classes, class_re)) {
+            won = classes[1].str().find("top-area-face-win") != std::string::npos;
+            lost = classes[1].str().find("top-area-face-lose") != std::string::npos;
+        }
+        if (!std::regex_search(tag, id, id_re)) continue;
+        if (!std::regex_search(tag, classes, class_re)) {
+            throw UserError("World of Minesweeper cell is missing its state");
+        }
+        const std::string style = classes[1];
+        const bool opened = style.find("_opened") != std::string::npos;
+        const bool closed = style.find("_closed") != std::string::npos;
+        if (opened == closed) throw UserError("unrecognized World of Minesweeper cell state");
+        std::smatch number_match;
+        int number = -1;
+        if (opened && std::regex_search(style, number_match, number_re)) {
+            number = std::stoi(number_match[1]);
+        }
+        const int x = std::stoi(id[1]), y = std::stoi(id[2]);
+        max_x = std::max(max_x, x);
+        max_y = std::max(max_y, y);
+        cells.push_back({x, y, number, closed});
+    }
+    if (!won) {
+        throw UserError(lost ? "World of Minesweeper import needs a completed, won game" :
+                        "World of Minesweeper board was not fully loaded by the browser");
+    }
+    if (cells.empty() || max_x > 1000 || max_y > 1000 ||
+        static_cast<size_t>(max_x + 1) * (max_y + 1) != cells.size()) {
+        throw UserError("World of Minesweeper board was not fully rendered");
+    }
+    Board board{max_y + 1, max_x + 1,
+                std::vector<uint8_t>(static_cast<size_t>(max_x + 1) * (max_y + 1), 0)};
+    std::vector<uint8_t> seen(board.mines.size(), 0);
+    for (const Cell& cell : cells) {
+        const size_t index = static_cast<size_t>(cell.y) * board.width + cell.x;
+        if (seen[index]++) throw UserError("World of Minesweeper board repeats a cell");
+        board.mines[index] = cell.mine;
+    }
+    for (const Cell& cell : cells) {
+        if (cell.number < 0) continue;
+        int adjacent = 0;
+        for (int other : neighbors(cell.y * board.width + cell.x,
+                                   board.height, board.width)) adjacent += board.mines[other];
+        if (adjacent != cell.number) {
+            throw UserError("World of Minesweeper displayed numbers disagree with mine positions");
+        }
+    }
+    return board;
+}
+
+static Board load_world_game(const std::string& url) {
+    return parse_world_game_dom(world_game_dom(url));
+}
+
 static Board load_board(const std::string& source) {
+    if (is_world_game_url(trim(source))) return load_world_game(trim(source));
     std::error_code ec;
     const fs::path path(source);
     const bool is_file = fs::is_regular_file(path, ec);
@@ -352,8 +573,8 @@ static Board load_board(const std::string& source) {
     if (is_file) {
         return parse_mbf_bytes(std::vector<uint8_t>(raw.begin(), raw.end()));
     }
-    throw UserError("input must be a PTTACG string or compatible LlamaSweeper URL, "
-                    "an MBF file, or quoted MBF hexadecimal");
+    throw UserError("input must be a PTTACG string, compatible LlamaSweeper URL, "
+                    "World of Minesweeper game URL, MBF file, or quoted MBF hexadecimal");
 }
 
 static std::tuple<int, int, int> standard_board_spec(const std::string& difficulty) {
@@ -1265,20 +1486,136 @@ struct OrderChoice {
     std::vector<int> order;
 };
 
+struct OrderRequest {
+    enum class Kind { Auto, Plain, Smart, Dynamic, FixedBand, ExactBands } kind;
+    std::string orientation;
+    bool reverse = false;
+    int band_size = 1;
+    std::vector<int> widths;
+};
+
+static OrderRequest parse_order_request(const std::string& name) {
+    if (name == "auto") return {OrderRequest::Kind::Auto, "", false, 1, {}};
+    OrderRequest result{OrderRequest::Kind::Plain, "", false, 1, {}};
+    size_t offset;
+    if (name.rfind("columns", 0) == 0) {
+        result.orientation = "columns";
+        offset = 7;
+    } else if (name.rfind("rows", 0) == 0) {
+        result.orientation = "rows";
+        offset = 4;
+    } else throw UserError("invalid --order value: " + name);
+    if (name.compare(offset, 8, "-reverse") == 0) {
+        result.reverse = true;
+        offset += 8;
+    }
+    const std::string suffix = name.substr(offset);
+    if (suffix.empty()) return result;
+    if (suffix == "-smart") {
+        result.kind = OrderRequest::Kind::Smart;
+        return result;
+    }
+    if (suffix == "-dynamic") {
+        result.kind = OrderRequest::Kind::Dynamic;
+        return result;
+    }
+    auto positive_number = [&](const std::string& value) {
+        if (value.empty() || !std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+                return ch >= '0' && ch <= '9';
+            })) throw UserError("invalid --order value: " + name);
+        size_t used = 0;
+        unsigned long long number;
+        try { number = std::stoull(value, &used); }
+        catch (...) { throw UserError("invalid --order value: " + name); }
+        if (used != value.size() || number == 0 ||
+            number > static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
+            throw UserError("invalid --order value: " + name);
+        }
+        return static_cast<int>(number);
+    };
+    if (suffix.rfind("-band-", 0) == 0) {
+        result.kind = OrderRequest::Kind::FixedBand;
+        result.band_size = positive_number(suffix.substr(6));
+        return result;
+    }
+    if (suffix.rfind("-dynamic-", 0) == 0) {
+        result.kind = OrderRequest::Kind::ExactBands;
+        std::istringstream parts(suffix.substr(9));
+        std::string width;
+        while (std::getline(parts, width, '.')) {
+            result.widths.push_back(positive_number(width));
+        }
+        if (result.widths.empty() || suffix.back() == '.') {
+            throw UserError("invalid --order value: " + name);
+        }
+        return result;
+    }
+    throw UserError("invalid --order value: " + name);
+}
+
+static std::vector<int> explicit_band_order_indices(const Model& model,
+                                                     const OrderRequest& request) {
+    const bool columns = request.orientation == "columns";
+    const int line_count = columns ? model.width : model.height;
+    std::vector<int> group(line_count), position(line_count);
+    int line = 0;
+    for (size_t band = 0; band < request.widths.size(); ++band) {
+        if (request.widths[band] > line_count - line) {
+            throw UserError("--order dynamic band widths must sum to " +
+                            std::to_string(line_count));
+        }
+        for (int within = 0; within < request.widths[band]; ++within, ++line) {
+            group[line] = static_cast<int>(band);
+            position[line] = within;
+        }
+    }
+    if (line != line_count) {
+        throw UserError("--order dynamic band widths must sum to " +
+                        std::to_string(line_count));
+    }
+    std::vector<int> order(model.candidates.size());
+    std::iota(order.begin(), order.end(), 0);
+    auto key = [&](int candidate) {
+        const int cell = model.candidates[candidate];
+        const int r = cell / model.width, c = cell % model.width;
+        const int physical = columns ? c : r;
+        const int sweep = request.reverse ? line_count - 1 - physical : physical;
+        return std::tuple<int, int, int>{group[sweep], columns ? r : c, position[sweep]};
+    };
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return key(a) < key(b); });
+    return order;
+}
+
 static std::pair<Model, std::string> choose_order(const Model& model,
                                                    const std::string& requested,
                                                    std::optional<int> band_size) {
     if (requested != "auto") {
-        if (requested == "columns-smart" || requested == "rows-smart") {
-            if (band_size) throw UserError("--band-size cannot be combined with a smart order");
-            const std::string base = requested.substr(0, requested.find('-'));
-            auto order = smart_line_order_indices(model, base);
-            return {ordered_model(model, order), requested};
+        const OrderRequest order = parse_order_request(requested);
+        if (band_size && order.kind != OrderRequest::Kind::Plain) {
+            throw UserError("--band-size requires a plain row or column --order (or auto)");
         }
-        const int size = band_size.value_or(1);
-        auto order = order_indices(model, requested, size);
-        const std::string name = size == 1 ? requested : requested + "-band-" + std::to_string(size);
-        return {ordered_model(model, order), name};
+        if (order.kind == OrderRequest::Kind::Smart) {
+            auto indices = smart_line_order_indices(model, order.orientation, order.reverse);
+            return {ordered_model(model, indices), requested};
+        }
+        if (order.kind == OrderRequest::Kind::Dynamic) {
+            auto dynamic = dynamic_band_order(model, order.orientation, order.reverse);
+            std::string label = requested + '-';
+            for (size_t i = 0; i < dynamic.widths.size(); ++i) {
+                if (i) label += '.';
+                label += std::to_string(dynamic.widths[i]);
+            }
+            return {ordered_model(model, dynamic.order), label};
+        }
+        if (order.kind == OrderRequest::Kind::ExactBands) {
+            return {ordered_model(model, explicit_band_order_indices(model, order)), requested};
+        }
+        const int size = order.kind == OrderRequest::Kind::FixedBand
+            ? order.band_size : band_size.value_or(1);
+        auto indices = order_indices(model, order.orientation, size, order.reverse);
+        const std::string name = order.kind == OrderRequest::Kind::FixedBand || size == 1
+            ? requested : requested + "-band-" + std::to_string(size);
+        return {ordered_model(model, indices), name};
     }
     std::vector<OrderChoice> choices;
     int standard_best = std::numeric_limits<int>::max();
@@ -3074,7 +3411,8 @@ static void print_coord_json(std::ostream& out, int cell, const Model& model) {
 static void print_json(const Model& model, const Solution& solution,
                        const std::optional<std::string>& generated_difficulty,
                        const std::optional<uint64_t>& generated_seed,
-                       const std::optional<std::string>& generated_url) {
+                       const std::optional<std::string>& generated_url,
+                       const std::optional<std::string>& imported_url) {
     std::cout << "{\n  \"optimal_clicks\": " << solution.clicks
               << ",\n  \"three_bv\": " << model.three_bv() << ",\n";
     if (!solution.count_only) {
@@ -3150,6 +3488,9 @@ static void print_json(const Model& model, const Solution& solution,
                   << json_escape(*generated_difficulty) << "\",\"seed\":" << *generated_seed
                   << ",\"url\":\"" << json_escape(*generated_url) << "\"}";
     }
+    if (imported_url) {
+        std::cout << ",\n  \"imported_board_url\":\"" << json_escape(*imported_url) << '"';
+    }
     std::cout << "\n}\n";
 }
 
@@ -3185,8 +3526,8 @@ static void print_help(const char* program) {
     std::cout
         << "Deterministically Optimal Minesweeper Solver (DOMS, C++17)\n\n"
         << "Usage: " << program << " [BOARD] [options]\n\n"
-        << "BOARD may be a PTTACG string or compatible LlamaSweeper URL,\n"
-        << "MBF filename, or quoted MBF hex.\n\n"
+        << "BOARD may be a PTTACG string, compatible LlamaSweeper URL,\n"
+        << "World of Minesweeper game URL, MBF filename, or quoted MBF hex.\n\n"
         << "Options:\n"
         << "  --generate beginner|intermediate|expert\n"
         << "                                 Generate, print, and solve one random board\n"
@@ -3196,7 +3537,7 @@ static void print_help(const char* program) {
         << "  --threads N                    Bulk workers (default: one per available core)\n"
         << "  --count-only                   Compute click count without a move replay\n"
         << "  --no-count-only                Include replay (default for single boards)\n"
-        << "  --order auto|rows|columns|rows-smart|columns-smart\n"
+        << "  --order NAME                  Choose any printed sweep order (or auto)\n"
         << "  --band-size N\n"
         << "  --progress\n"
         << "  --profile                    Print a timing breakdown on single boards\n"
@@ -3288,9 +3629,10 @@ static Options parse_options(int argc, char** argv) {
         if (!options.board) throw UserError("a board argument, --generate, or --bulk is required");
         if (options.seed) throw UserError("--seed requires --generate or --bulk");
     }
-    if (options.order != "auto" && options.order != "rows" && options.order != "columns" &&
-        options.order != "rows-smart" && options.order != "columns-smart") {
-        throw UserError("invalid --order value");
+    const OrderRequest parsed_order = parse_order_request(options.order);
+    if (options.band_size && parsed_order.kind != OrderRequest::Kind::Auto &&
+        parsed_order.kind != OrderRequest::Kind::Plain) {
+        throw UserError("--band-size requires a plain row or column --order (or auto)");
     }
     if (options.json && options.click_tuples) throw UserError("choose only one of --json and --click-tuples");
     if (options.threads && !options.bulk) throw UserError("--threads requires --bulk");
@@ -3381,6 +3723,7 @@ int main(int argc, char** argv) {
         }
         Board board;
         std::optional<std::string> generated_url;
+        std::optional<std::string> imported_url;
         std::optional<uint64_t> generated_seed;
         if (options.generate) {
             uint64_t seed;
@@ -3391,6 +3734,10 @@ int main(int argc, char** argv) {
                       << "Random seed: " << seed << "\n";
         } else {
             board = load_board(*options.board);
+            if (is_world_game_url(trim(*options.board))) {
+                imported_url = format_llamasweeper_url(board);
+                std::cerr << "Imported board: " << *imported_url << "\n";
+            }
         }
 
         const auto start = std::chrono::steady_clock::now();
@@ -3430,7 +3777,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (options.json) {
-            print_json(model, solution, options.generate, generated_seed, generated_url);
+            print_json(model, solution, options.generate, generated_seed,
+                       generated_url, imported_url);
             return 0;
         }
         std::cout << "Optimal clicks: " << solution.clicks << " (3BV without chording: "

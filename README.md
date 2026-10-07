@@ -18,8 +18,9 @@ It outputs both the optimal number of clicks and a valid sequence of actions
 that achieves it. The solver is exact: dominance pruning affects performance,
 not the correctness of the result.
 
-The implementation is a standalone C++17 program with no third-party
-dependencies.
+The solver is a standalone C++17 program with no third-party libraries.
+Importing a World of Minesweeper game URL requires an installed Chrome,
+Edge, or Chromium browser. It does not require Python.
 
 ## Building
 
@@ -49,8 +50,21 @@ cl /std:c++17 /O2 /DNDEBUG /EHsc minesweeper_chord_dp.cpp /Fe:doms.exe
 ### Windows with MinGW-w64
 
 ```console
-g++ -std=c++17 -O3 -DNDEBUG -march=native -pthread minesweeper_chord_dp.cpp -o doms.exe
+g++ -std=c++17 -O3 -DNDEBUG -pthread minesweeper_chord_dp.cpp -o doms.exe
 ```
+
+This Windows command uses a portable x86-64 instruction target. If the program
+crashes with a CPU-specific build, first rebuild without `-march=native` and
+run the same board again. `-mtune=native` can tune scheduling without enabling
+new instructions, but it is optional. If the crash persists, record the
+compiler name/version, the exact command and board, and the Windows exception
+code (Event Viewer → Windows Logs → Application). An illegal-instruction
+exception points toward an instruction/CPU mismatch; an access violation
+points toward memory access and needs a debugger backtrace to locate it.
+Windows may close a crashing console program without printing an exception;
+`echo %ERRORLEVEL%` immediately after the command or the Application event
+can reveal the exit code. With MinGW GDB, `gdb --args doms.exe BOARD` followed
+by `run` and `bt` at the GDB prompt captures the faulting call stack.
 
 The resulting executable does not require Python.
 
@@ -121,6 +135,32 @@ The standard board codes are:
 Unambiguous custom-dimension codes are also supported. The `m=` value is the
 row-major mine bitfield, packed five cells per character with the alphabet
 `0-9a-v`.
+
+### World of Minesweeper game URL
+
+For a **completed, won** game, DOMS can read the rendered board from
+Minesweeper Online (formerly World of Minesweeper):
+
+```console
+./doms "https://minesweeper.online/game/2899477113" --count-only
+```
+
+On Windows, use `doms.exe` instead of `./doms`. DOMS launches an installed
+Chrome, Edge, or Chromium browser in headless mode and reads the rendered cells
+from its DOM. It looks for a browser in common installation locations and on
+`PATH`. If yours is elsewhere, set `DOMS_BROWSER` to the executable path:
+
+```bat
+set "DOMS_BROWSER=C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+doms.exe "https://minesweeper.online/game/2899477113" --count-only
+```
+
+DOMS prints `Imported board:` followed by a compatible LlamaSweeper
+board-editor URL to standard error before solving. With `--json`, the same URL
+is also in `imported_board_url`. This import needs internet access and works
+for completed, won games: once every safe cell is open, every closed cell is a
+mine. It cannot infer all mines from an unfinished or lost game's visible
+cells. The game URL contains an ID, not the board data.
 
 ### MBF file or hexadecimal
 
@@ -271,8 +311,8 @@ JSON output includes:
 ```text
 Usage: doms [BOARD] [options]
 
-BOARD may be a PTTACG string or compatible LlamaSweeper URL,
-MBF filename, or quoted MBF hexadecimal.
+BOARD may be a PTTACG string, compatible LlamaSweeper URL,
+World of Minesweeper game URL, MBF filename, or quoted MBF hexadecimal.
 ```
 
 | Option | Meaning |
@@ -283,9 +323,10 @@ MBF filename, or quoted MBF hexadecimal.
 | `--threads N` | Set the number of bulk solver threads; default is one per available core. Requires `--bulk`. |
 | `--count-only` | Store only state costs and omit move reconstruction; default for bulk runs. |
 | `--no-count-only` | Reconstruct moves; default for single boards. |
-| `--order auto\|rows\|columns\|rows-smart\|columns-smart` | Choose the frontier ordering. Smart orders optimize the order within each row or column; the default is `auto`. |
-| `--band-size N` | Force a fixed band width of `N` rows or columns. With `--order auto`, compare both orientations. Without this option, auto also considers variable-width bands. |
+| `--order NAME` | Choose `auto` (the default) or any sweep order printed on the `DP:` line. Examples include `columns-reverse-smart`, `rows-reverse-band-2`, and `columns-reverse-dynamic-2.1.1.1.4.1.1.1.1.1.1.1`. See below for the naming rules. |
+| `--band-size N` | Force a fixed band width of `N` rows or columns. With `--order auto`, compare both orientations; with a plain row or column order, use that direction. |
 | `--progress` | Print frontier size and pruning progress for one board; print completed boards during bulk runs. |
+| `--profile` | Print phase timings, dominance details, and processed/generated state counts to standard error for a single board. |
 | `--json` | Print machine-readable JSON. |
 | `--click-tuples` | Print only `(click_type, x, y)` tuples. |
 | `-h`, `--help` | Display command-line help. |
@@ -306,12 +347,22 @@ Force a particular sweep direction:
 ```console
 ./doms example.mbf --order rows
 ./doms example.mbf --order columns
+./doms example.mbf --order columns-reverse-smart
 ```
 
 Try wider frontier bands:
 
 ```console
 ./doms example.mbf --band-size 2
+./doms example.mbf --order columns-reverse-band-2
+./doms example.mbf --order columns-reverse-dynamic
+```
+
+Find where one solve spends its time (including dominance subphases):
+
+```console
+./doms example.mbf --profile
+./doms example.mbf --count-only --profile
 ```
 
 ## What is being optimized?
@@ -417,6 +468,14 @@ width, and accumulated estimated work, in that order. A selected order such as
 search still evaluates the exact click objective regardless of which ordering
 is chosen. Supplying `--band-size` continues to force the requested fixed
 width.
+
+`--order` accepts `rows` or `columns`, optionally followed by `-reverse`,
+then one of `-smart`, `-band-N`, or `-dynamic`. The `-dynamic` form computes
+variable widths for that direction. You can also pass the full order name
+printed on the `DP:` line, such as `columns-dynamic-7.4.1.1.8.1.6.2`, to
+reuse those exact widths on the same board. The widths must sum to the number
+of rows or columns being swept. `--band-size` combines only with `auto` or a
+plain row or column direction (with optional `-reverse`).
 
 ## Complexity and limitations
 
