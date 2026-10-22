@@ -1,5 +1,255 @@
 # Optimization history
 
+## Experiment: contiguous reachability-bucket signature IDs
+
+Replace each dominance bucket's independently allocated signature-ID vector
+with a slice of one shared array. Count IDs while assigning buckets, assign
+disjoint slices, then fill them in the original ascending signature order.
+Keep pair postings, witness selection, pruning certificates, search limits,
+and all comparisons unchanged. Include the existing workspace edits in the
+baseline and preserve them regardless of this experiment's outcome.
+
+Build both versions with MSYS2 UCRT64 and identical C++17 optimization flags.
+Compare full solver/replay results and pruning counters, then run sequential
+baseline/changed/changed/baseline plain `--benchmark` invocations. Keep only
+a measurable overall improvement; otherwise revert this experiment's solver
+change and stop. Temporary snapshots, executables, tests, and logs live in
+`%TEMP%\doms-bucket-ids-20261021`, outside version control.
+
+### Results: retained
+
+Both builds used MSYS2 UCRT64 GCC and
+`-std=c++17 -O3 -DNDEBUG -pthread`. The changed build additionally enabled
+`-Wall -Wextra -Wpedantic` and compiled without diagnostics. Four plain
+`--benchmark` invocations ran sequentially in A/B/B/A order, without other
+compilation or solver jobs from this session overlapping measurement. Each
+used one thread, a successful high-priority request, 100 warm-up boards per
+fixed set, and three timed repeats. Cells sum each set's three repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 47.484813 | 46.236706 | 45.988799 | 47.829965 |
+| 2 | 46.136814 | 44.831986 | 44.628910 | 46.057485 |
+| 3 | 45.295159 | 43.225148 | 43.498751 | 44.887431 |
+| Total solve seconds | 138.916786 | 134.293840 | 134.116460 | 138.774881 |
+
+Mean totals decreased from **138.845834 s to 134.205150 s (3.34%)**.
+Both adjacent pairs improved (3.33% and 3.36%), as did all six corresponding
+set totals. Mean CPU time decreased from 137.101563 s to 132.953125 s (3.03%).
+These are local measurements from two invocations per build; they support
+retention on this workload without guaranteeing improvement on every board.
+Peak memory was not measured.
+
+- All four benchmarks passed unchanged board, 3BV, and optimal-click
+  references: 36,000 timed solves and 1,200 warm-ups on 3,000 distinct boards.
+- All non-timing JSON fields, exact replay actions, and four state/pruning
+  counter lines matched in 36 baseline/changed comparisons: three standard
+  difficulties, seeds 1, 42, 100, 2026, 123456, and 8675309, and both solve
+  modes. All 18 changed replays passed built-in legal-action validation.
+- An assertion-enabled differential harness compared the actual baseline
+  and changed pruning functions on 2,000 seeded tables across compact/wide
+  factor masks, count-only/replay records, and one through three connectivity
+  words. Survivors, costs, replay histories, and all pruning counters matched.
+  Cases included empty signatures, overlapping reaches, bit 63, common-union
+  buckets large enough to use pair postings, and heap-backed replay histories.
+- The shared array preserves ascending signature IDs within every bucket.
+  Posting selection and witness order are unchanged. No objective, pruning
+  certificate, search limit, or benchmark reference changed.
+
+Source snapshots, measured executables, the temporary differential harness,
+comparison script, solver JSON/profile outputs, raw benchmark logs, and
+`results.json` are retained in the artifact directory above. Existing
+workspace edits were preserved. `doms.exe` is the measured changed build,
+verified by SHA-256 and an Expert replay smoke check. `git diff --check` passed.
+
+## Experiment: free anchors before augmenting connectivity matches
+
+In the inline (at most 64 components) connectivity-coarsening matcher, try
+an unmatched eligible fine component before recursively displacing existing
+anchors. Track matched fine components with a word mask, initializing matching
+entries only when assigned. Eligibility entries are also assigned before use,
+so their full-array zero initialization is unnecessary. Retain the original
+augmenting-path fallback and the general wide-component implementation.
+
+This computes the same exact containment-and-matching predicate, changing only
+how a matching is found. No dominance certificate, objective, search limit,
+ordering choice, or replay tie break changes.
+
+Build baseline and changed sources with MSYS2 UCRT64 and identical C++17
+optimization flags. Compare the actual original and changed predicates on
+randomized and boundary cases, then compare complete count-only/replay results.
+Run sequential baseline/changed/changed/baseline fixed benchmarks, retaining
+the default warm-up and three timed repeats. Keep only a measurable overall
+improvement; otherwise revert the solver change and stop. Temporary artifacts
+are outside version control in `%TEMP%\doms-free-match-20261021`.
+
+### Results: reverted; no measurable improvement
+
+Both builds used MSYS2 UCRT64 GCC and `-std=c++17 -O3 -DNDEBUG -pthread`.
+The changed build additionally enabled `-Wall -Wextra -Wpedantic` and had no
+diagnostics. Runs were sequential A/B/B/A with no overlapping compilation
+or solver jobs. Each used plain `--benchmark`: one thread, a high-priority
+request (successful), 100 warm-up boards per fixed set, and three timed
+repeats of all three 1,000-board Expert sets.
+
+| Invocation | Total solve seconds (all nine timed sets) |
+| --- | ---: |
+| Baseline 1 | 138.811153 |
+| Changed 1 | 138.425759 |
+| Changed 2 | 134.783628 |
+| Baseline 2 | 134.298911 |
+
+Mean totals were **136.555032 s baseline** and **136.604694 s changed**:
+the change was 0.036% slower. The first adjacent pair favored the change by
+0.28%, while the second favored baseline by 0.36%. CPU-time totals likewise
+showed no meaningful separation (means 135.210938 s and 135.109375 s).
+Visible timing drift exceeds the differences between builds. There is no
+demonstrated overall speed improvement, so the entire solver change was
+reverted and no follow-on optimization was attempted.
+
+- All four default benchmark invocations passed unchanged board, 3BV, and
+  optimal-click references: 36,000 timed solves and 1,200 warm-up solves over
+  3,000 distinct Expert boards.
+- An assertion-enabled differential harness compared the actual original
+  and changed matching functions on 300,000 seeded cases, using one through
+  three signature words. It included empty signatures, overlapping reaches,
+  constructed containment cases, and 64-, 65-, and 66-component boundaries.
+  Every result matched, including the unchanged general fallback.
+- All semantic JSON fields, replay actions, and profiling state/pruning
+  counters matched across 36 full-solver comparisons: three standard
+  difficulties, seeds 1, 42, 100, 2026, 123456, and 8675309, and both modes.
+  All 18 changed replays passed built-in legal-action validation.
+
+Baseline/changed source snapshots, measured executables, the temporary
+matching harness, comparison/benchmark script, raw logs and machine-readable
+timings are retained in the artifact directory above. No benchmark reference
+data changed. `doms.exe` was rebuilt from the restored baseline source.
+
+## Experiment: contiguous cached dominance entries
+
+Replace the separate cached-state allocation for each reachability bucket
+with one table-sized buffer and disjoint slices assigned from the existing
+bucket state counts. Populate and sort each slice in the same order as before.
+The buffer stays fixed during pruning, preserving survivor pointer validity.
+This changes allocation only: objectives, comparisons, witness ordering,
+pruning certificates, and search limits remain unchanged. Both factor-mask
+representations and replay/count-only specializations use the same code.
+
+Include all pre-existing workspace edits in the baseline. Build both versions
+with MSYS2 UCRT64 and identical C++17 optimization flags. Run full sequential
+baseline/changed/changed/baseline `--benchmark` invocations and differential
+solver/replay checks. Keep the experiment only if it establishes a measurable
+overall improvement; otherwise restore the source snapshot and stop.
+
+Artifacts are outside version control under
+`C:\Users\happy\AppData\Local\Temp\doms-bucket-storage-20261021`.
+
+### Results: retained
+
+Both builds used MSYS2 UCRT64 GCC with identical
+`-std=c++17 -O3 -DNDEBUG -pthread` optimization flags. The changed build
+also enabled `-Wall -Wextra -Wpedantic` and compiled without diagnostics.
+Four complete benchmark invocations ran sequentially, with no compilation
+or other solver jobs from this session overlapping the timing runs.
+Each set contains 1,000 fixed Expert boards, one thread, count-only:
+
+| Fixed set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 17.613099 | 17.319839 | 17.562920 | 17.689766 |
+| 2 | 16.869075 | 16.614381 | 16.865247 | 17.162854 |
+| 3 | 16.410030 | 16.110726 | 16.438888 | 16.639500 |
+| Total | 50.892204 | 50.044946 | 50.867055 | 51.492120 |
+
+Mean total time decreased from **51.192162 s to 50.456001 s (1.44%)**.
+Both adjacent pairs improved overall (1.66% and 1.21%), as did all six
+corresponding set totals. This is a modest local gain from two repetitions
+per version, with timing variation; it does not establish a gain on every
+board. Peak memory was not measured. The new buffer default-initializes
+entries before population, trading that work for fewer bucket allocations.
+
+- All four complete `--benchmark` invocations passed unchanged board, 3BV,
+  and optimal-click references: 12,000 solves over 3,000 distinct boards.
+- All non-timing JSON fields and state/pruning counters matched across 36
+  full solver comparisons: three difficulties, seeds 1, 42, 100, 2026,
+  123456, and 8675309, and both solve modes. All 18 changed replays passed
+  built-in legal-action validation.
+- A temporary differential harness compared the actual baseline and changed
+  pruning functions on 2,000 seeded tables across compact/wide factor masks,
+  count-only/replay records, and one through three connectivity words.
+  Survivors, costs, chosen histories, and all pruning counters matched.
+  Cases included empty signatures, overlapping reaches, boundary bit 63,
+  large common-union buckets, and heap-backed replay histories.
+
+Source snapshots, measured builds, temporary differential harnesses,
+comparison outputs, and raw benchmark logs/results are in the artifact
+directory above. Existing workspace changes were preserved. `doms.exe` is
+the measured retained build, verified by SHA-256 and an Expert replay smoke
+check. `git diff --check` passed.
+
+## Smart ordering: count closed vertices with the existing subset transform
+
+### Plan and implementation
+
+The smart-line scorer previously scanned every selected current-line vertex
+at every subset cut to count vertices with an unprocessed neighbor. A vertex
+without a later-line neighbor closes exactly when its closed neighborhood
+(itself and its same-line neighbors) is contained in the selected mask.
+Add one histogram entry for that closed neighborhood to the existing
+old-vertex histogram, before its subset-zeta transform. The transformed value
+then counts both closed old vertices and closed current-line vertices.
+The live-vertex score is `old_always + old_total + popcount(mask) - closed`.
+
+This removes the selected-vertex loop at every cut and two small per-line
+arrays without adding another transform or subset-sized buffer. The final
+vertex scoring loop is O(2^p) instead of O(p * 2^p); the existing transform
+and path DP still take O(p * 2^p). Every graph score, factor score, tie break,
+and complete order is preserved. No search, pruning certificate, objective,
+or search limit changes.
+
+### Validation
+
+- Baseline and changed builds used MSYS2 UCRT64 GCC with identical
+  `-std=c++17 -O3 -DNDEBUG -pthread` optimization flags. The changed build
+  also enabled `-Wall -Wextra -Wpedantic` and compiled without diagnostics.
+- An assertion-enabled temporary harness compared the actual original and
+  changed smart-order functions. All 4,400 complete orders matched: 300
+  seeded standard boards before and after reduction, plus 500 synthetic
+  graph/scope models, each in both orientations and both sweep directions.
+- The harness also compared 2,097,151 cut counts with direct selected-vertex
+  scans, covering every mask at each line size from zero through 20.
+- All non-timing JSON fields and state/pruning counters matched in 36
+  baseline/changed solver comparisons: three difficulties, seeds 1, 42, 100,
+  2026, 123456, and 8675309, and both count-only and replay modes. All 18
+  replays passed the built-in legal-action checks.
+- Four complete sequential `--benchmark` invocations passed all unchanged
+  board, 3BV, and optimal-click references: 12,000 solves over 3,000 distinct
+  Expert boards. No compilation or other solver jobs from this session
+  overlapped the timing runs.
+- `git diff --check` passed. `doms.exe` is the measured changed build.
+
+### Measurements
+
+Runs were baseline/changed/changed/baseline. Each cell is total seconds for
+one fixed 1,000-board Expert set, on one thread in count-only mode:
+
+| Fixed set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 18.325184 | 17.795119 | 18.472514 | 19.200669 |
+| 2 | 17.636364 | 16.986800 | 17.755737 | 18.270290 |
+| 3 | 17.372248 | 16.487635 | 17.787841 | 17.382446 |
+| Total | 53.333796 | 51.269554 | 54.016092 | 54.853405 |
+
+Mean total runtime decreased from **54.093601 s to 52.642823 s (2.7%)**.
+Both adjacent pairs improved overall (3.9% and 1.5%), but the third set in
+the second pair regressed. These are local measurements from two repetitions
+per build, with visible timing variation; gains remain workload-dependent.
+Memory use was not measured.
+
+Baseline source, original executable, measured builds, temporary differential
+harness, comparison script/outputs, and raw benchmark logs/results are saved
+outside version control under
+`C:\Users\happy\AppData\Local\Temp\doms-live-vertices-20261021`.
+
 ## Next optimization: combine crossing-count subset transforms
 
 Smart line ordering subtracts three transformed scope histograms when scoring
@@ -217,6 +467,10 @@ change removes redundant erasure work and lookup memory on large layers, but
 dominance comparisons and transitions still dominate total runtime. Larger
 overall gains require optimizing those phases. All bulk CSV rows matched.
 
+**Current status: excluded.** The completed-layer index release had no
+demonstrated material overall speedup and was removed in the combined
+weak-evidence ablation.
+
 `doms.exe` was rebuilt from the final source and smoke-tested. Its previous
 version is saved as `original-doms.exe` in the temporary artifact directory;
 `compiler_check.cpp` and `expert-results.csv` remain untouched.
@@ -315,6 +569,10 @@ Validation and measurements:
   runs had medians of 5.431 s and 5.332 s (1.8% faster); per-run timings varied
   with machine load.
 - `git diff --check` passed.
+
+**Current status: excluded.** Separate results favored deferred growth, but
+the latest controlled review had contradictory rounds. It was removed in the
+combined weak-evidence ablation.
 
 ## Next optimization: sort one-word connectivity components directly
 
@@ -445,6 +703,11 @@ run-to-run variation, so treat the speed result as provisional. The changed
 build also completed an Expert replay smoke check. `doms.exe` was left
 untouched. Build variants and CSV/logs are in the system temporary directory
 under `doms-before-stamps` and `stamps-*.csv` / `stamps-*.log`.
+
+**Current status: excluded.** The 1.0% result was within likely run-to-run
+variation. Generation stamps were removed in the combined weak-evidence
+ablation; the independently measured one-word binary-search optimization
+remains enabled.
 
 ## Next optimization: direct one-word connectivity transitions
 
@@ -978,6 +1241,10 @@ The measured changed executable was installed as `doms.exe`, checked by SHA-256,
 and passed an Expert replay smoke check. Its previous version is archived as
 `original-doms.exe`. `git diff --check` passed.
 
+**Current status: excluded.** The 0.5% result did not demonstrate a reliable
+end-to-end speedup. This early rejection was removed in the combined
+weak-evidence ablation.
+
 ## Candidate reduction: enumerate eligible replacement neighbors
 
 Swap reduction previously scanned every candidate as a possible replacement,
@@ -1029,6 +1296,10 @@ Baseline source and executable, discarded matching experiment, differential
 harnesses, comparison scripts, and raw logs/results are outside version
 control under `C:\Users\happy\AppData\Local\Temp\doms-matching-20261021`.
 The retained experiment's logs have the `neighbor-` prefix.
+
+**Current status: excluded.** The 0.7% difference was within timing variation
+and did not establish a material speedup. Candidate reduction again scans
+replacement candidates in their original order.
 
 ## Dominance setup: scalar keys for one-word connectivity unions
 
@@ -1093,3 +1364,1229 @@ Baseline source, original executable, measured builds, temporary harness and
 validation scripts, comparison outputs, and raw logs/results are outside
 version control in
 `C:\Users\happy\AppData\Local\Temp\doms-scalar-union-20261021`.
+
+## Connectivity matching: initialize only live scratch entries
+
+### Plan and implementation
+
+The common connectivity-coarsening matcher uses two stack arrays with capacity
+for 64 components. Initialize only `coarse_count` eligibility entries and
+`fine_count` matching entries, replacing full-capacity clearing. Eligibility
+is indexed only by coarse components; the augmenting-path search indexes
+matching entries only by bits set for fine components. Thus every read still
+has its original initialized value. Matching order, eligibility, dominance
+certificates, and search limits are unchanged. The general path for more than
+64 components is unchanged. Existing working-tree changes were preserved in
+the baseline.
+
+### Validation
+
+- Baseline and changed builds used MSYS2 UCRT64 GCC with identical
+  `-std=c++17 -O3 -DNDEBUG -pthread` flags. The changed build additionally
+  enabled `-Wall -Wextra -Wpedantic` and compiled without diagnostics.
+- A temporary differential harness compared the actual old and new matching
+  functions on 100,000 deterministic cases, with one through three signature
+  words and zero through 66 components. All results matched, including the
+  boundary between stack and general storage.
+- All non-timing JSON fields matched in 36 complete solver comparisons:
+  three standard difficulties, seeds 1, 42, 100, 2026, 123456, and 8675309,
+  and count-only/replay modes. All 18 replays passed built-in simulation.
+- Four sequential full `--benchmark` invocations passed all unchanged board,
+  3BV, and optimal-click references: 12,000 solves over 3,000 distinct boards.
+  Compilation and other solver jobs from this session did not overlap them.
+- `git diff --check` passed. `doms.exe` is the measured changed build.
+
+### Measurements
+
+Runs were baseline/changed/changed/baseline; seconds per fixed 1,000-board set:
+
+| Fixed set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 18.755798 | 17.758627 | 18.405119 | 18.006809 |
+| 2 | 17.724715 | 17.080053 | 17.655041 | 17.265003 |
+| 3 | 17.040404 | 16.808487 | 17.159585 | 16.807114 |
+| Total | 53.520917 | 51.647167 | 53.219745 | 52.078926 |
+
+Mean total runtime decreased from **52.799922 s to 52.433456 s (0.7%)**.
+The first pair improved and the second regressed; this difference is within
+observed timing variation. The change eliminates redundant initialization,
+but these measurements do not establish a material overall speedup. Memory
+use was not measured. Source snapshot, executables, temporary harness,
+comparison script, and raw logs are outside version control under
+`C:\Users\happy\AppData\Local\Temp\doms-matching-init-20261021`.
+
+**Current status: excluded.** The 0.7% gain was inconsistent and not material
+end-to-end. Full matcher scratch-array initialization is restored.
+
+
+## Smart ordering: keep the subset winner local
+
+### Plan and implementation
+
+The smart-line subset DP previously updated its score and predecessor arrays
+whenever it found a better predecessor. Keep the winning score and bit in local
+variables, then write each array once per subset. Compute the subset's graph,
+factor, total, and estimated-work costs once outside its predecessor loop.
+Predecessors are still visited in the same ascending-bit order with the same
+strict comparison, including saturated work and ties. Every score and complete
+order is preserved. No objective, dominance certificate, or search limit changes.
+Existing workspace changes were preserved in the baseline snapshot.
+
+An equal-cost factor-dominance bit-test experiment was evaluated first and
+removed: its two changed benchmark runs averaged about 1.4% slower than baseline.
+It is not part of the retained implementation.
+
+### Validation
+
+- Baseline and changed builds used MSYS2 UCRT64 GCC with identical
+  `-std=c++17 -O3 -DNDEBUG -pthread` flags. The changed build also enabled
+  `-Wall -Wextra -Wpedantic` and compiled without diagnostics.
+- An assertion-enabled temporary harness compared the actual original and
+  changed smart-order functions. All 1,920 complete orders matched: 180 seeded
+  standard boards (60 per difficulty), before and after reduction, plus 120
+  synthetic scope/graph models, each in both orientations and sweep directions.
+  Synthetic cases exercised ties, saturated work, empty/singleton lines, the
+  20-candidate exact subset limit, and the wider-line fallback.
+- All non-timing JSON fields matched in 36 full-solver comparisons across three
+  difficulties, seeds 1, 42, 100, 2026, 123456, and 8675309, and both solve modes.
+  All 18 changed replays passed built-in legal-action simulation.
+- Four sequential full `--benchmark` invocations passed all unchanged board,
+  3BV, and optimal-click references: 12,000 solves over 3,000 distinct boards.
+  Compilation and other solver jobs from this session did not overlap timing.
+
+### Measurements
+
+Runs were baseline/changed/changed/baseline; seconds per fixed 1,000-board set:
+
+| Fixed set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 17.170677 | 17.315589 | 16.229758 | 17.030711 |
+| 2 | 16.660881 | 16.046551 | 15.464903 | 16.505660 |
+| 3 | 15.986088 | 16.168430 | 15.129523 | 15.961244 |
+| Total | 49.817646 | 49.530570 | 46.824184 | 49.497615 |
+
+Mean total runtime decreased from **49.657630 s to 48.177377 s (3.0%)**.
+Both changed totals were below both baseline totals, but the first pair improved
+only slightly and the second pair improved much more. These are local results
+from two repetitions per build with visible timing variation; gains remain
+workload-dependent. Memory use was not measured.
+
+Baseline source and executable, original `doms.exe`, the discarded experiment,
+temporary differential harness and validation script, comparison outputs, and
+raw logs/results are outside version control under
+`C:\Users\happy\AppData\Local\Temp\doms-zero-penalty-20261021`.
+The retained experiment's benchmark logs have the `order-` prefix.
+`doms.exe` is the measured changed build (verified by SHA-256) and passed an Expert seed-100 replay smoke check. `git diff --check` passed.
+
+
+## Candidate reduction: decide the deletion threshold directly
+
+### Plan and implementation
+
+The left-click dominance proof previously computed the maximum independent-set
+score even when a branch's upper bound was already below the deletion threshold.
+Its caller needs only to decide whether any score exceeds that threshold.
+Prune against the threshold directly and remove the running maximum. Also count
+base factors before building the local proof graph: a negative threshold has
+an empty-set counterexample, and a neighborhood no larger than the threshold
+cannot exceed it. Both cases now avoid unnecessary local graph construction.
+The existing conservative 63-neighbor and 63-base limits are preserved.
+
+For a search node, any completion has score at most
+`chosen + popcount(available) - popcount(covered)`: it cannot select more than
+all available neighbors, and existing coverage cannot decrease. Therefore an
+upper bound at or below the threshold proves that branch safe. Every returned
+certificate is identical to the original function. Candidate deletion order,
+DP states, objective, dominance certificates, search limits, and replay behavior
+are unchanged. Existing workspace edits were preserved in the baseline.
+
+### Validation
+
+- Baseline and changed builds used MSYS2 UCRT64 GCC with identical
+  `-std=c++17 -O3 -DNDEBUG -pthread` flags. The changed build also enabled
+  `-Wall -Wextra -Wpedantic` and compiled without diagnostics.
+- An assertion-enabled temporary harness compared the actual baseline and
+  changed proof functions in 179,246 decisions. It included 20,000 synthetic
+  graphs with independently exhaustive independent-set maxima, each at five
+  private-mine counts; all candidates in 300 seeded standard boards before
+  and after reduction; and explicit degree/base-count cases around 63/64,
+  including multiple storage words. All decisions matched.
+- All non-timing JSON fields matched in 36 complete solver comparisons across
+  three difficulties, seeds 1, 42, 100, 2026, 123456, and 8675309, and both
+  count-only and replay modes. All 18 replays passed built-in simulation.
+- Four final sequential full `--benchmark` invocations validated 12,000 solves
+  over the same 3,000 distinct Expert boards against unchanged board, 3BV,
+  and optimal-click references. No compilation or other solver jobs from this
+  session overlapped these timing runs.
+- Four earlier benchmark invocations also passed. Those evaluated the initial
+  threshold-only change and are excluded from the final measurements below.
+- `git diff --check` passed. `doms.exe` contains the measured combined change.
+
+### Measurements
+
+Final runs were baseline/changed/changed/baseline. Seconds per fixed 1,000-board
+Expert set, on one thread in count-only mode:
+
+| Fixed set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 16.821743 | 16.870489 | 16.593257 | 16.721542 |
+| 2 | 16.223792 | 15.916200 | 15.966691 | 16.007069 |
+| 3 | 15.545817 | 15.675236 | 15.625386 | 15.503000 |
+| Total | 48.591352 | 48.461925 | 48.185334 | 48.231611 |
+
+Mean total time decreased from **48.411482 s to 48.323630 s (0.18%)**.
+Both adjacent pairs improved slightly, but individual sets were mixed. This
+is within observed timing variation and does **not** establish a material
+end-to-end speedup. In the instrumented standard-board differential cases,
+proof-search node visits fell from 1,196,950 to 1,180,948 (1.3%); on synthetic
+cases they fell from 1,482,305 to 377,993 (74.5%). These counts describe the
+focused harness, not the fixed Expert benchmark. Memory use was not measured.
+The retained change avoids redundant proof work, with limited measured impact
+on total runtime.
+
+Baseline source, original executable, measured baseline, temporary harnesses,
+comparison scripts, and raw logs/results are outside version control under
+`C:\Users\happy\AppData\Local\Temp\doms-threshold-20261021`.
+Final timing logs use the `baseline-3`, `changed-3`, `changed-4`, and `baseline-4`
+prefixes. Earlier `-1` and `-2` logs cover the threshold-only experiment.
+
+**Current status: excluded.** The 0.18% overall difference did not establish a
+material speedup. The original maximum-score proof search is restored.
+
+
+## Smart ordering: fold vertex closures into the zero-scope transform
+
+### Plan and implementation
+
+The zero-scope crossing score subtracts a subset sum at the selected mask.
+The live-vertex score also subtracts a subset sum at the same mask: old
+vertices close when all their remaining neighbors have been processed, and
+current-line vertices close when their closed neighborhood has been processed
+and they have no later-line neighbors. Insert both kinds of vertex closures
+into the zero-scope before histogram, before its subset transform. Add the
+old-vertex constant and selected-vertex population when producing graph scores.
+
+By linearity, transforming the combined histogram subtracts exactly the same
+scope and vertex counts as the two separate transforms. This removes one of
+five transforms per eligible line, its zero-filled integer buffer, and the
+separate graph-score update pass. The subset DP, all cut scores, tie breaks,
+complete orders, candidate reductions, exact search, pruning certificates, and
+search limits are preserved. Existing workspace edits were included in the
+baseline snapshot and preserved.
+
+### Validation
+
+- Baseline and changed builds used MSYS2 UCRT64 GCC with identical
+  `-std=c++17 -O3 -DNDEBUG -pthread` flags. The changed build additionally
+  enabled `-Wall -Wextra -Wpedantic` and compiled without diagnostics.
+- An assertion-enabled temporary harness compared the actual baseline and
+  changed smart-order functions: all 1,936 complete orders and 1,277,387,968
+  graph/factor cut-score entries matched. Coverage included 180 seeded
+  standard boards before and after reduction, 120 synthetic graph/scope
+  models, both orientations and sweep directions, empty and singleton lines,
+  the 20-candidate exact-subset limit, and the 21-candidate fallback.
+- All non-timing JSON fields matched in 36 baseline/changed full-solver
+  comparisons across three standard difficulties, seeds 1, 42, 100, 2026,
+  123456, and 8675309, and both solve modes. All 18 changed replays passed
+  built-in legal-action simulation.
+- Four sequential full `--benchmark` invocations passed all unchanged board,
+  3BV, and optimal-click references: 12,000 solves over 3,000 distinct Expert
+  boards. No compilation or other solver jobs from this session overlapped
+  the timing runs.
+- `git diff --check` passed. `doms.exe` is the measured changed build.
+
+### Measurements
+
+Runs were baseline/changed/changed/baseline. Seconds per fixed 1,000-board
+Expert set, on one thread in count-only mode:
+
+| Fixed set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 17.389895 | 17.418298 | 17.932518 | 18.243635 |
+| 2 | 16.884031 | 16.973652 | 17.424523 | 17.944907 |
+| 3 | 16.647934 | 17.183833 | 17.030785 | 16.956516 |
+| Total | 50.921860 | 51.575783 | 52.387826 | 53.145058 |
+
+Mean total runtime decreased from **52.033459 s to 51.981805 s (0.10%)**.
+The first pair regressed and the second improved; machine timing drift is
+larger than the average difference. These measurements do **not** establish a
+material overall speedup. The retained change eliminates redundant transform
+work while preserving every ordering score and exact search result. Peak
+memory consumption was not measured; eliminating an allocation does not imply
+that overall peak storage decreased.
+
+Source snapshots, the previous executable, measured baseline, differential
+harness, full-solver comparison script and outputs, and raw benchmark logs are
+outside version control under
+`C:\Users\happy\AppData\Local\Temp\doms-fused-closures-20261021`.
+
+**Current status: excluded.** The 0.10% result did not establish a material
+speedup. Vertex closures are scored separately from the zero-scope transform.
+
+## Combined ablation of weak-evidence optimizations
+
+Removed the optimizations whose individual plan results were provisional or
+within timing variation: deferred hash-table growth, completed-layer lookup
+index release, opening-absorption generation stamps, early rejection in
+connectivity coarsening, propagation-neighbor enumeration during candidate
+reduction, live-only initialization in the connectivity matcher, direct
+threshold pruning, and folding vertex closures into the zero-scope transform.
+The original opening-absorption scan, full matcher initialization, ordinary
+candidate scan, indexed layer erasure, and separate closure scoring are
+restored. Changes with repeatable measured gains remain enabled.
+
+The all-features source was saved before removal. Both builds used MSYS2
+UCRT64 GCC with `-std=c++17 -O3 -DNDEBUG -pthread`. Runs were sequential in
+all/removed/removed/all order. Each invocation ran the same three fixed
+1,000-board Expert sets in single-thread count-only mode and validated every
+board encoding, 3BV value, and optimal click count against the tracked
+reference data.
+
+| Version | Run 1 total (s) | Run 2 total (s) | Mean (s) |
+| --- | ---: | ---: | ---: |
+| All features | 47.682944 | 51.657843 | 49.670394 |
+| Weak-evidence features removed | 48.915017 | 50.402885 | 49.658951 |
+
+The reduced version was 0.02% faster by the two-run mean, which is below the
+observed run-to-run variation. The paired runs disagree: the full version was
+faster in the first pair, and the reduced version was faster in the second.
+This combined workload gives no measurable overall speed benefit for keeping
+the removed features. All four invocations passed all 3,000 references.
+
+The all-features source snapshot, both executables, and four benchmark logs
+are outside version control under
+`C:\Users\happy\AppData\Local\Temp\doms-weak-ablation-20261021`.
+
+## Dominance setup: flat lookup for one-word reachability unions
+
+### Plan and implementation
+
+A fresh Expert seed 100 profile attributed 0.003 s of a 0.022 s solve to
+dominance setup. One-word signatures used a temporary `unordered_map` to
+assign buckets by the union of their component reaches. Replace its node
+allocations with a flat slot array holding bucket IDs and a dense vector of
+full 64-bit union keys. Hash with the existing mixer and resolve collisions
+by linear probing and full-key equality. Size the index for at most half
+occupancy using the incoming connectivity count, with overflow checking.
+The multiword union map remains the same.
+
+Buckets are still assigned in incoming signature order. The lookup index is
+never iterated to choose comparison order. Thus bucket IDs, state order,
+sorted witnesses, pruning decisions, and replay tie breaks are preserved.
+There are no changes to the objective, pruning certificates, schedule, or
+search limits. Existing workspace changes were included in the baseline.
+
+### Validation
+
+- Both solver builds used MSYS2 UCRT64 GCC and identical
+  `-std=c++17 -O3 -DNDEBUG -pthread` flags.
+- Two retained-version and two bracketing baseline `--benchmark` invocations
+  each passed all 3,000 fixed board, 3BV, and optimal-click references.
+- All non-timing JSON fields and processed/generated-state and pruning
+  counters matched in 36 comparisons across three standard difficulties,
+  six seeds, and both count-only and replay modes. All 18 changed replays
+  passed the solver's built-in action validation.
+- A temporary differential harness compared the actual baseline and changed
+  pruning functions on 2,000 seeded tables across all four compact/wide-mask
+  and count-only/replay specializations, with one through three connectivity
+  words. Survivors, costs, chosen histories, and each pruning counter matched.
+  Cases included empty signatures, duplicate unions, singleton buckets, and
+  deliberately colliding scalar keys. Wide masks included bits above 64 and
+  chosen histories used heap storage. The harness compiled with
+  `-std=c++17 -O2 -pthread -Wall -Wextra -Wpedantic` without diagnostics.
+
+### Measurements
+
+All benchmark invocations ran sequentially, with no compilation or other
+solver jobs from this session overlapping timing. Each cell is seconds for
+one fixed 1,000-board Expert set, one thread, count-only:
+
+| Fixed set | Baseline before | Changed 1 | Changed 2 | Baseline after |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 17.738838 | 16.803126 | 16.477592 | 18.439407 |
+| 2 | 17.112707 | 16.366381 | 17.018925 | 17.626944 |
+| 3 | 16.078824 | 16.018189 | 16.694723 | 17.345220 |
+| Total | 50.930369 | 49.187696 | 50.191240 | 53.411571 |
+
+Mean total runtime decreased from **52.170970 s to 49.689468 s (4.8%)**.
+Both neighboring baseline/changed pairs improved, as did all six corresponding
+set totals. These are local measurements from two repetitions per version;
+the baseline drift shows machine activity affects the result. Peak memory
+was not measured. `doms.exe` is the measured retained build.
+
+Earlier trials of three-candidate pruning, software population counts,
+runtime hardware population counts, singleton-bucket skipping, and a
+zero-penalty dominance shortcut passed references but did not establish a
+speed benefit. Those changes were discarded. An additional initial baseline
+took 50.215280 s; it is excluded from the two bracketing-run mean above.
+
+Source snapshots, the baseline executable, temporary differential harness,
+comparison script, and raw logs are outside version control under
+`C:\Users\happy\AppData\Local\Temp\doms-prune-cadence-20261021`.
+
+## Experiment: direct index for dominance pair postings
+
+Replace the hash map for one-word coarsening pair postings with a 4096-slot
+integer index and dense posting vectors, allocated only for eligible buckets
+(at least 64 signatures). Keys encode two boundary positions as `(a << 6) | b`.
+The posting contents, candidate selection order, and all dominance certificates
+remain identical. Multiword signatures use the existing path. No objective,
+search limit, or pruning schedule changes.
+
+Compare identical optimized MSYS2 UCRT64 builds in sequential
+baseline/changed/changed/baseline full `--benchmark` runs. Validate reference
+counts, representative complete outputs and replay simulations. Retain only
+if measurements establish a speed improvement; otherwise restore the source
+snapshot and stop. Existing workspace edits are included in the baseline.
+
+### Results: retained
+
+Both builds used MSYS2 UCRT64 GCC with identical
+`-std=c++17 -O3 -DNDEBUG -pthread` optimization flags. The changed build also
+used `-Wall -Wextra -Wpedantic` and compiled without diagnostics.
+
+Six sequential full benchmark invocations ran in
+baseline/changed/changed/baseline/changed/baseline order. No compilation or
+other solver jobs from this session overlapped the timing runs. Each cell
+below is seconds for one fixed 1,000-board Expert set, single-thread,
+count-only:
+
+| Fixed set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 | Changed 3 | Baseline 3 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 18.843277 | 18.271297 | 17.694449 | 18.758690 | 17.470948 | 17.998452 |
+| 2 | 17.600979 | 17.583820 | 17.028529 | 17.828358 | 16.859608 | 17.070656 |
+| 3 | 16.733105 | 17.062245 | 16.639988 | 16.491319 | 16.180903 | 16.595932 |
+| Total | 53.177361 | 52.917362 | 51.362966 | 53.078367 | 50.511459 | 51.665040 |
+
+Mean total time decreased from **52.640256 s to 51.597262 s (1.98%)**.
+All three neighboring pairs improved overall (0.49%, 3.23%, and 2.23%).
+Seven of nine paired set totals improved; the third set regressed in the
+first two pairs. This is a modest local improvement from three repetitions
+per build, with visible timing variation, rather than a gain on every board.
+Peak memory was not measured; the direct index costs 16 KiB per eligible
+bucket in addition to dense posting-vector storage, replacing hash nodes.
+
+Validation completed successfully:
+
+- All six benchmark invocations passed unchanged board, 3BV, and optimal-click
+  references: 18,000 solves over the same 3,000 distinct Expert boards.
+- A temporary differential harness extracted the actual baseline pruning
+  function and compared 2,000 seeded randomized tables across compact/wide
+  masks, count-only/replay records, and one through three signature words.
+  Large common-union buckets exercised pair postings and boundary bits through
+  bit 63. Survivors, costs, chosen histories, and all pruning counters matched.
+- All non-timing JSON fields and processed/generated-state and pruning counters
+  matched in 36 complete solver comparisons: three standard difficulties,
+  seeds 1, 42, 100, 2026, 123456, and 8675309, and both solve modes. All 18
+  changed replays passed built-in legal-action validation.
+
+Source snapshots, the previous executable, measured baseline and changed
+builds, temporary harnesses, comparison script, and raw timing logs/results
+are outside version control under
+`C:\Users\happy\AppData\Local\Temp\doms-pair-index-20261021`.
+`doms.exe` is the measured retained build. `git diff --check` passed.
+
+
+## Experiment: specialize one-word connectivity comparisons
+
+Compile fixed-one-word versions of connectivity coarsening and common-merge
+penalty calculations, dispatching to them when `signature_words == 1`.
+Keep the same algorithms and runtime-width fallback for larger signatures.
+The fixed width allows removal of inner word loops, runtime divisions, and
+index multiplications. Exact quotient already has a scalar path and is
+unchanged. Matching order, certificates, pruning schedule, objectives, and
+search limits are unchanged. Include all existing workspace edits in baseline.
+
+Compare identical MSYS2 UCRT64 `-std=c++17 -O3 -DNDEBUG -pthread` builds using
+sequential baseline/changed/changed/baseline `--benchmark` invocations.
+Compare the actual original relation functions on seeded random signatures,
+including multiword and greater-than-64-component cases. Compare complete
+solver outputs and state/pruning counters across difficulties and solve modes.
+Retain only if a measurable overall speed improvement is established;
+otherwise restore this experiment's source snapshot, record results, and stop.
+
+
+### Results: retained
+
+Both builds used MSYS2 UCRT64 GCC with identical optimization flags. The
+changed build additionally enabled `-Wall -Wextra -Wpedantic` and compiled
+without diagnostics. All four benchmark invocations ran sequentially, with
+no compilation or other solver jobs from this session overlapping timing.
+Each set contains 1,000 fixed Expert boards, one thread, count-only:
+
+| Fixed set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 17.915614 | 17.570839 | 17.408438 | 17.803069 |
+| 2 | 17.342171 | 16.890086 | 16.954896 | 17.321863 |
+| 3 | 16.713121 | 16.457434 | 16.429458 | 16.647511 |
+| Total | 51.970906 | 50.918359 | 50.792792 | 51.772443 |
+
+Mean total time decreased from **51.871674 s to 50.855576 s
+(1.96%)**. Both adjacent pairs improved overall,
+as did all six corresponding set totals. This is a modest local gain from
+two repetitions per build on one machine; timing variation remains and this
+is not evidence of improvement on every board. Peak memory was not measured.
+
+Validation:
+
+- All four complete `--benchmark` runs passed unchanged board, 3BV, and
+  optimal-click references: 12,000 solves across 3,000 distinct Expert boards.
+- A temporary assertion-enabled harness compared the actual original and
+  changed coarsening and merge-penalty functions on 60,000 seeded signature
+  pairs. It exercised one through three words, empty signatures, overlapping
+  reaches, bit 63, containment, and component counts beyond 64 (including
+  the merge routine's 128-total-component limit). Both results always matched.
+- All non-timing JSON fields and state/pruning counters matched across 36
+  complete solver comparisons: three difficulties, seeds 1, 42, 100, 2026,
+  123456, and 8675309, and both count-only and replay modes. All 18 changed
+  replays passed built-in legal-action validation.
+
+Sources, the original executable, measured builds, temporary relation harness,
+comparison script, solver comparison result, and raw benchmark logs/results
+are outside version control under
+`C:\Users\happy\AppData\Local\Temp\doms-word-specialization-20261021`.
+`doms.exe` is the measured retained build. `git diff --check` passed.
+
+## Experiment: short-circuit smart-order predecessor scores
+
+Evaluate predecessor scores in lexicographic field order, rejecting a losing
+prefix before calculating later maxima and saturated work. Preserve strict
+comparison, ascending predecessor-bit order, saturation, and every chosen
+order. No objective, pruning certificate, or search limit changes. Include
+all existing workspace edits in the baseline.
+
+Build with identical MSYS2 UCRT64 C++17 optimization flags. Compare complete
+smart orders directly, including synthetic models and saturation cases, and
+compare full solver outputs in count-only and replay modes. Measure sequential
+baseline/changed/changed/baseline full `--benchmark` runs. Retain only on a
+measurable overall improvement; otherwise restore this experiment's source
+snapshot, record the result, and stop. Temporary artifacts are under
+`%TEMP%\doms-score-shortcircuit-20261021`.
+
+### Results: reverted; no reliable speed improvement
+
+Baseline and changed builds used MSYS2 UCRT64 with identical
+`-std=c++17 -O3 -DNDEBUG -pthread` optimization flags. The changed build
+also used `-Wall -Wextra -Wpedantic` and compiled without diagnostics.
+All timing runs were sequential; no compilation or other solver jobs from
+this session overlapped them. An additional changed/baseline pair followed
+the planned four invocations because the initial gain was only about 0.5%.
+Each set contains 1,000 fixed Expert boards, one thread, count-only:
+
+| Fixed set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 | Changed 3 | Baseline 3 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 17.580575 | 17.411942 | 17.546679 | 17.507573 | 17.597110 | 17.312475 |
+| 2 | 16.902536 | 16.791807 | 16.764601 | 17.009913 | 16.840884 | 16.854705 |
+| 3 | 16.347988 | 16.356316 | 16.345516 | 16.399495 | 16.399349 | 16.374669 |
+| Total | 50.831099 | 50.560065 | 50.656796 | 50.916981 | 50.837343 | 50.541849 |
+
+Mean total runtime was **50.763310 s baseline versus 50.684735 s changed**,
+a nominal **0.15%** reduction. The first two neighboring pairs improved by
+about 0.53% and 0.51%, but the third regressed by 0.58%. The small aggregate
+difference and inconsistent repeated result do not establish a reliable
+speed improvement. The optimization was reverted and no follow-on
+optimization was attempted, as required by repository guidance.
+
+Correctness validation passed before reverting:
+
+- All six complete `--benchmark` invocations passed unchanged board, 3BV,
+  and optimal-click references: 18,000 solves over 3,000 distinct boards.
+- All non-timing JSON fields and state/pruning counters matched across 36
+  baseline/changed comparisons: three standard difficulties, seeds 1, 42,
+  100, 2026, 123456, and 8675309, and both solve modes. All 18 changed
+  replays passed the built-in legal-action validation.
+- A temporary assertion-enabled harness compared the actual baseline and
+  changed smart-order functions on 300 generated boards, before and after
+  candidate reduction, in both orientations and sweep directions. All
+  2,400 complete orders matched.
+- A separate assertion-enabled harness compared 2,002 complete synthetic
+  orders, covering sparse/dense graphs, empty/repeated scopes, equal scores,
+  high crossing counts, and middle-column work sums that saturate at the
+  maximum uint64_t value. Every order matched.
+
+The source was restored byte-for-byte from this experiment's baseline
+snapshot, verified by SHA-256. Existing workspace edits were preserved.
+`doms.exe` was left unchanged and matches its pre-experiment snapshot by
+SHA-256. `git diff --check` passed. Source snapshots, measured binaries,
+temporary harnesses/scripts, raw logs, and summaries are outside version
+control under `%TEMP%\doms-score-shortcircuit-20261021`.
+
+
+## Experiment: precompute last-neighbor sweep lines
+
+For smart ordering, precompute the latest sweep line among each vertex's
+neighbors. A vertex from an earlier line is always live before that last
+neighbor line, and already closed after it. Only on that last line is a
+neighbor scan needed to construct its subset mask. Isolated vertices keep
+last line -1 and never contribute. Compute this separately for each sweep
+orientation and direction. Every cut score, predecessor tie break, complete
+order, and subsequent exact DP search remains unchanged.
+
+Include all existing workspace edits in the baseline. Build with identical
+MSYS2 UCRT64 C++17 optimization flags, compare actual complete smart orders
+on generated boards and synthetic graphs, and compare full solver outputs
+in replay and count-only modes. Measure sequential baseline/changed/changed/
+baseline full `--benchmark` runs against the unchanged reference CSV. Retain
+only if they establish a measurable speed improvement; otherwise restore
+this experiment's source snapshot, record the result, and stop. Temporary
+artifacts are under `%TEMP%\doms-neighbor-extents-20261021`.
+
+
+### Results: reverted; no speed improvement
+
+Both builds used MSYS2 UCRT64 GCC with identical
+`-std=c++17 -O3 -DNDEBUG -pthread` optimization flags. The changed build
+also enabled `-Wall -Wextra -Wpedantic` and compiled without diagnostics.
+The four full benchmark invocations ran sequentially, without overlapping
+compilation or other solver jobs from this session. Each set contains 1,000
+fixed Expert boards, on one thread in count-only mode:
+
+| Fixed set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 16.529994 | 17.113621 | 16.778322 | 16.489810 |
+| 2 | 15.705320 | 16.156075 | 16.177385 | 15.869222 |
+| 3 | 16.665725 | 15.616542 | 16.306804 | 16.471484 |
+| Total | 48.901039 | 48.886238 | 49.262511 | 48.830516 |
+
+Mean total time was **48.865778 s baseline versus 49.074375 s changed**.
+The changed version was **0.43% slower** overall.
+The first neighboring pair was effectively tied; the second regressed.
+These local measurements do not establish a speed improvement. The change
+was reverted and no follow-on optimization was attempted, as required by
+repository guidance.
+
+Correctness validation passed before reverting:
+
+- All four complete `--benchmark` runs passed unchanged board, 3BV, and
+  optimal-click references: 12,000 solves over 3,000 distinct Expert boards.
+- An assertion-enabled temporary harness compared the actual baseline and
+  changed smart-order functions on 300 generated standard boards, before
+  and after candidate reduction, and 500 synthetic graphs. All 4,400 complete
+  orders matched across both orientations and both sweep directions. Cases
+  included sparse/dense graphs, isolated vertices, empty scopes, long-range
+  edges, and unreduced standard-board lines near the 20-candidate limit.
+- All non-timing JSON fields matched across 36 full solver comparisons:
+  three standard difficulties, seeds 1, 42, 100, 2026, 123456, and 8675309,
+  and both solve modes. All 18 changed replays passed built-in legal-action
+  validation.
+
+The solver source was restored byte-for-byte from this experiment's baseline
+snapshot, verified by SHA-256. Existing workspace edits were preserved and
+`doms.exe` was left untouched. Snapshots, measured binaries, temporary test
+harness/script, solver comparison outputs, and raw benchmark logs/results are
+outside version control under `%TEMP%\doms-neighbor-extents-20261021`.
+
+
+## Candidate reduction: reuse left-click proof buffers
+
+`left_click_dominated_candidate` builds temporary adjacency and base-factor
+lists for each candidate. Reuse two vectors across candidates in the same
+reduction pass, clearing their logical contents while retaining capacity.
+Enumeration order, threshold checks, branch-and-bound decisions, candidate
+deletion order, and every proof remain unchanged. This removes repeated vector
+allocations without changing the exact search.
+
+Both builds used MSYS2 UCRT64 GCC 16.1.0 with identical
+`-std=c++17 -O3 -DNDEBUG -pthread` flags. The four full `--benchmark`
+invocations ran sequentially in baseline/changed/changed/baseline order. Each
+invocation validated the same three fixed 1,000-board Expert sets against the
+tracked board, 3BV, and optimal-click references:
+
+| Fixed set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 18.223447 | 17.167035 | 16.534316 | 17.096901 |
+| 2 | 16.662144 | 16.453467 | 15.977757 | 16.524882 |
+| 3 | 15.829085 | 15.445578 | 15.455024 | 15.867986 |
+| Total | 50.714676 | 49.066080 | 47.967097 | 49.489769 |
+
+The two-run mean decreased from **50.102223 s to 48.516589 s (3.17%)**.
+Each changed set was faster than the mean of its two bracketing baseline set
+times. All four complete benchmark runs passed all 3,000 references. These
+measurements establish a local gain on this fixed Expert workload; other
+boards and machines may differ. No objective, search limit, or proof rule
+changed.
+
+
+## Candidate reduction: reuse left-click proof masks
+
+The retained proof-list reuse still allocated `local_edges` and
+`local_base_hits` for every candidate examined by left-click dominance. This
+experiment retained those two vectors across candidates in one reduction
+pass, resized them to the current neighborhood, and cleared their active
+entries before constructing the same masks. The independent-set proof,
+branch order, threshold, and candidate deletion rules were unchanged.
+
+The baseline and changed builds used MSYS2 UCRT64 GCC with identical
+`-std=c++17 -O3 -DNDEBUG -pthread` flags. Runs were sequential and used the
+fixed Expert benchmark, one thread, count-only mode:
+
+| Version | Run 1 (s) | Run 2 (s) | Mean (s) |
+| --- | ---: | ---: | ---: |
+| Baseline | 51.909274 | 49.752073 | 50.830674 |
+| Reused masks | 50.601965 | 50.684702 | 50.643334 |
+
+The mean difference was a nominal **0.37%** improvement. The first
+baseline/changed pair favored reuse by 2.52%, while the second favored the
+baseline by 1.87%. This does not establish a measurable speedup. All four
+benchmark invocations passed their 3,000 board, 3BV, and optimal-click
+reference checks. The allocation change was reverted, and no follow-on
+optimization was attempted, as required by repository guidance.
+
+
+## Experiment: cache factor-state hashes
+
+The state table recomputes a factor-state hash while erasing each pruned state
+and while rebuilding its lookup index. This experiment stored the hash beside
+each inserted state and reused it for those operations. State equality,
+insertion order, pruning decisions, and the exact search were unchanged.
+
+Both builds used MSYS2 UCRT64 GCC 16.1.0 and identical
+`-std=c++17 -O3 -DNDEBUG -pthread` flags. Runs used the fixed Expert benchmark,
+one thread, count-only mode; all invocations passed all 3,000 board, 3BV, and
+optimal-click reference checks:
+
+| Version | Run 1 (s) | Run 2 (s) | Run 3 (s) | Total (s) |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline 1 | 17.644634 | 16.758513 | 16.299776 | 50.702923 |
+| Baseline 2 | 17.669821 | 16.691577 | 16.190764 | 50.552162 |
+| Cached hashes | 17.625194 | 17.309432 | 17.207105 | 52.141731 |
+
+The cached-hash build was **3.0% slower** than the mean of the two baseline
+runs. It was reverted, and no follow-on optimization was attempted, as
+required by repository guidance.
+
+
+## Experiment: defer DP table growth until a new state is found
+
+`FactorTable::find_or_emplace` grew its lookup index before probing. This
+experiment moved the capacity check to the empty-slot insertion path, allowing
+duplicate successors to return without triggering a rehash and allowing an
+available tombstone to be reused. State equality, record creation, insertion
+order, and all solver decisions were unchanged.
+
+The current workspace snapshot was compiled as the baseline, then the changed
+source was compiled with MSYS2 UCRT64 GCC using the same
+`-std=c++17 -O3 -DNDEBUG -pthread` flags. The changed build additionally used
+`-Wall -Wextra -Wpedantic`. Runs were sequential and each full
+`--benchmark` invocation validated all 3,000 fixed board, 3BV, and
+optimal-click references:
+
+| Version | Run 1 (s) | Run 2 (s) | Mean (s) |
+| --- | ---: | ---: | ---: |
+| Baseline | 55.847557 | 54.478325 | 55.162941 |
+| Deferred growth | 56.014413 | 55.035980 | 55.525197 |
+
+Deferred growth was **0.66% slower** overall. The first changed/baseline pair
+was close, while the second was about 1.0% slower. This does not establish a
+measurable speed improvement, so the table change was reverted and no
+follow-on optimization was attempted. The fixed benchmark references passed
+for all four invocations. The changed build also matched the baseline on the
+Expert seed-100 row-order profile's state totals, pruning counters, and
+121-click optimum. Timing artifacts and the baseline source/executable are
+outside version control under `%TEMP%\doms-deferred-growth-20261021`.
+
+
+## Benchmark variance: consolidate the lab format into `--benchmark`
+
+Tested the existing ordinary and lab modes using the current workspace solver,
+MSYS2 UCRT64 GCC, and `-std=c++17 -O3 -DNDEBUG -pthread`. One temporary binary
+served both modes; its only source change exposed the already-collected solve
+and CPU totals in ordinary-mode output. No solver or timer logic changed.
+Six pairs ran sequentially, alternating order: plain/lab, lab/plain,
+plain/lab, lab/plain, plain/lab, lab/plain. Lab used its default 100-board
+warm-up per set and high priority, with `--benchmark-repeat 1` to compare equal
+numbers of timed boards. Neither mode used affinity. Priority elevation
+succeeded for every lab invocation. No compilation overlapped timing.
+
+| Pair | Ordinary solve total (s) | Lab solve total (s) |
+| --- | ---: | ---: |
+| 1 | 51.676915 | 48.345400 |
+| 2 | 48.258731 | 47.305842 |
+| 3 | 48.478502 | 47.746444 |
+| 4 | 47.165941 | 47.656021 |
+| 5 | 48.766850 | 48.813554 |
+| 6 | 50.560232 | 48.031953 |
+
+| Metric across six invocations | Ordinary | Lab |
+| --- | ---: | ---: |
+| Mean whole-benchmark solve seconds | 49.151195 | 47.983202 |
+| Whole-benchmark solve CV | 3.075% | 1.023% |
+| Whole-benchmark wall CV | 3.075% | 1.021% |
+| Fixed set 1 solve CV | 3.220% | 1.598% |
+| Fixed set 2 solve CV | 2.242% | 0.963% |
+| Fixed set 3 solve CV | 4.854% | 0.708% |
+
+CV uses population standard deviation / mean. Whole-benchmark solve CV fell
+about 67%, corresponding to about 90% lower observed timing variance. Dropping
+the first pair still favors lab: solve CV 2.261% versus 1.059%. All 36,000 timed
+board checks and 1,800 lab warm-up checks passed unchanged board, 3BV, and
+optimal-click references. This is evidence of improved repeatability on this
+Windows machine, not a guarantee on other machines. The experiment tests the
+warm-up/priority bundle; it does not isolate their individual contributions or
+quantify the additional effect of taking medians over three repeats. Solve-only
+and total-wall CV were nearly identical, so solve-only timing by itself did not
+explain the improvement.
+
+Retained the lab format as `--benchmark`: 100 warm-up boards per set, best-effort
+high priority, three timed repeats by default, detailed rows and per-set
+median/min/max/CV summaries. Removed `--benchmark-lab`, its option state, and
+the duplicate ordinary single-thread output branch. Retained optional warm-up,
+repeat, and affinity controls; multithread benchmarking keeps its existing
+format and rejects these single-thread controls. No solver optimization or
+reference-data change was made. Experiment source, harness, executable, and raw
+logs are outside the repository under
+`%TEMP%\doms-benchmark-variance-20261021`.
+
+Final validation: rebuilt `doms.exe` with the prescribed UCRT64 command. The
+new default passed all 9,000 timed references plus 300 warm-up checks; its
+per-set solve CVs were 0.300%, 0.885%, and 0.596%. Independently recomputed all
+aggregate medians, minima, maxima, and CVs from printed rows. The one-repeat,
+zero-warm-up shortcut passed all 3,000 references. Help and seven invalid-option
+checks passed, including removal of the lab flag and rejection of single-thread
+controls with multithread mode. `git diff --check` passed. No generated files
+or temporary test sources were added to version control.
+
+
+## Integrate upstream optimizations through `45f1929`
+
+Reviewed the current `qqwref/doms` master via GitHub; its head was
+`45f1929830a6dd40b3b0a79200904c3a1115ee85`. The fork's HEAD (`a6f07c8`)
+was already included in upstream through merge `a726cfd`. The two missing
+optimization commits were:
+
+- [`c511e00`](https://github.com/qqwref/doms/commit/c511e00740b5de2032362cab0ca0c73b371ab42b):
+  store connectivity signature words in a shared arena, addressed by offsets.
+- [`45f1929`](https://github.com/qqwref/doms/commit/45f1929830a6dd40b3b0a79200904c3a1115ee85):
+  cache transition hash prefixes, shrink dominance cache records to direct
+  entry pointers plus packed primary keys, and streamline bucket storage.
+
+Integrated these changes into the existing uncommitted solver, preserving its
+fixed-word connectivity specializations, scalar union buckets, direct pair
+posting indexes, preprocessing/ordering improvements, and benchmark controls.
+Replay uses upstream's per-bucket cache buffers; count-only uses its shared
+uninitialized cache allocation. Arena views are used only while their pool
+is unchanged; callers reacquire views after interning or reserve operations.
+The locally reverted lookup-index release and deferred table-growth experiments
+were not restored. No command-line features or reference answers were added
+or changed.
+
+Built with MSYS2 UCRT64 GCC using
+`-std=c++17 -O3 -DNDEBUG -pthread -Wall -Wextra -Wpedantic`; no diagnostics.
+Compared the pre-integration workspace executable against the integrated build
+in sequential A/B/B/A order, with no compilation overlapping measurement.
+Each invocation used `--benchmark --benchmark-repeat 1`, retaining the default
+100 warm-up boards per set and high-priority request. All four invocations
+validated 3,000 timed boards and 300 warm-up boards against unchanged references.
+
+| Build | First solve total (s) | Second solve total (s) | Mean (s) |
+| --- | ---: | ---: | ---: |
+| Baseline | 48.878310 | 50.644570 | 49.761440 |
+| Integrated | 45.625173 | 48.233690 | 46.929432 |
+
+The integrated mean was **5.69% lower**.
+Both adjacent baseline/integrated pairs favored integration. This is a local
+measurement of the two upstream commits together, not an isolated measurement
+of each optimization or a guarantee on other workloads.
+
+Additional checks: 52 baseline/integrated JSON comparisons covering generated
+Beginner, Intermediate, and Expert boards, replay and count-only modes,
+explicit plain/smart/dynamic orders, MBF hexadecimal, and an empty board.
+All semantic JSON fields, actions, and search statistics matched after removing
+timing fields; replay also performed the solver's built-in legal-action checks.
+
+Based the README text on upstream's current README, retaining its organization
+and most wording. Kept necessary corrections for the actual benchmark defaults,
+options, working-directory requirement, Windows compiler selection, and reverted
+lookup-index behavior. Removed the upstream link to an absent benchmark report.
+All documented command-reference options exist in the parser. Detailed local
+experiment descriptions remain here instead of expanding the README.
+
+The signature-pool test also passed 100,000 randomized comparisons, reset/swap
+checks, forced hash collisions, and arena-growth/ID checks. Its former stable
+reference checks were adapted to reacquire views after pool mutations, as the
+new arena intentionally exposes temporary views. The test binary uses the
+ignored `benchmark_test.exe` name in the repository root.
+
+Temporary snapshots, test sources, baseline executable and raw timing logs
+are outside version control at `C:\Users\happy\AppData\Local\Temp\doms-upstream-20261021-i7cscxao`. Existing uncommitted changes were preserved.
+
+Final parallel validation: `--benchmark-multi --threads 4` passed all 3,000
+fixed references. In total the timing comparisons and parallel check passed
+15,000 timed reference checks plus 1,200 warm-up checks. `git diff --check`
+passed. No benchmark reference data or new tracked artifacts were added.
+
+## Experiment: release every completed pruning layer's lookup index
+
+The current solver still hashes and probes every erased state during dominance
+pruning. Release the completed layer's duplicate-lookup index before pruning,
+and erase using the existing stable dense entry position when the index is
+absent. Iteration and all dominance witness ordering remain unchanged. A later
+insertion rebuilds the index through the existing reserve path; lookup without
+an index retains the existing linear scan. This tests all pruning layers rather
+than the earlier review's optional large-index threshold.
+
+Build baseline and changed sources with identical MSYS2 UCRT64 C++17 flags.
+Compare count-only and replay JSON and state/pruning counters, exercise table
+lookup/erase/reinsertion directly, and run plain --benchmark sequentially in
+baseline/changed/changed/baseline order. Retain only a measurable improvement;
+otherwise revert this experiment's source changes and stop. Preserve existing
+workspace documentation edits. Temporary sources, executables and logs are in
+`%TEMP%\doms-prune-index-20261021`.
+
+### Results: retained
+
+Both builds used MSYS2 UCRT64 GCC with `-std=c++17 -O3 -DNDEBUG -pthread`.
+The changed build also enabled `-Wall -Wextra -Wpedantic` and compiled without
+diagnostics. All four invocations used plain `--benchmark`: one thread, high
+priority (successful), 100 warm-up boards per fixed set and three timed repeats.
+Runs were sequential A/B/B/A; no compilation or other solver jobs from this
+session overlapped timing runs. Cells below sum the three timed repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 46.068860 | 45.271938 | 45.985083 | 48.461022 |
+| 2 | 44.051886 | 43.796980 | 45.433218 | 46.465809 |
+| 3 | 43.073788 | 42.555784 | 43.923970 | 45.350165 |
+| Total solve seconds | 133.194534 | 131.624702 | 135.342271 | 140.276996 |
+
+Mean totals decreased from **136.735765 s to 133.483487 s (2.38%)**.
+Both adjacent pairs improved (1.18% and 3.52%), as did all six corresponding
+fixed-set totals. Mean CPU time decreased from 135.546875 s to 132.109375 s
+(2.54%). This supports retaining the change on this workload, but visible
+machine drift and two repetitions per build limit the precision of the gain.
+Peak memory was not measured; no claim is made for every board or workload.
+
+- All four benchmarks passed unchanged board, 3BV and optimal-click references:
+  36,000 timed solves and 1,200 warm-ups over 3,000 distinct Expert boards.
+- All non-timing JSON fields, including exact replay actions, matched in 36
+  baseline/changed comparisons: three standard difficulties, seeds 1, 42, 100,
+  2026, 123456 and 8675309, and both solve modes. All 18 changed replays passed
+  built-in action simulation. All four profile counter lines also matched for
+  every comparison, including processed/generated states, branch skips,
+  dominance passes and removals.
+- An assertion-enabled temporary table harness passed compact/wide factor
+  masks and count-only/replay specializations. It exercised empty/repeated
+  release, pointer/iterator erasure, repeated erasure, lookup and iteration
+  without an index, duplicate merging and index rebuilding on reinsertion,
+  erasure of every entry and insertion after exhaustion. Wide factors and
+  replay histories used five words to exercise heap storage.
+- The change removes only an obsolete lookup index. It changes no objective,
+  search limits, pruning certificates, state order or tie breaks.
+
+The experiment directory contains baseline/changed source snapshots, binaries,
+the assertion harness, comparison script, 72 solver JSON outputs and profile
+logs, raw benchmark logs, and `results.json`. Existing plan edits were preserved.
+The installed `doms.exe` is the measured changed binary. Benchmark references
+remain unchanged and tracked. `git diff --check` passed.
+
+
+## Experiment: reject empty connectivity matching rows immediately
+
+When building the inline connectivity containment graph, return false as soon
+as a coarse component has no eligible fine component. Every coarse component
+requires a distinct fine anchor, so an empty eligibility row makes a complete
+matching impossible. This avoids constructing later rows and running the
+matcher on that rejected pair. The general wide-component path is unchanged.
+No objective, pruning certificate, state ordering, or search limit changes.
+
+Preserve all existing workspace changes in the baseline. Build with MSYS2
+UCRT64 and identical C++17 optimization flags. Compare the actual baseline
+and changed predicates on randomized and boundary cases, compare complete
+count-only/replay results and counters, and run sequential plain --benchmark
+invocations in baseline/changed/changed/baseline order. Retain only a measurable
+overall improvement; otherwise revert this experiment's solver change and stop.
+Artifacts: `%TEMP%\doms-empty-match-20261021`, outside version control.
+
+### Results: reverted; no reliable measurable improvement
+
+Baseline and changed builds used MSYS2 UCRT64 GCC and
+`-std=c++17 -O3 -DNDEBUG -pthread`. The changed build additionally enabled
+`-Wall -Wextra -Wpedantic` and compiled without diagnostics. Four plain
+`--benchmark` invocations ran sequentially A/B/B/A, with no compilation or
+other solver jobs from this session overlapping measurements. Every invocation
+used one thread, high priority (successful), 100 warm-up boards per fixed set,
+and the default three timed repeats. Cells sum each set's three repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 44.333276 | 45.022385 | 44.343812 | 44.549729 |
+| 2 | 42.666552 | 42.631306 | 42.591500 | 42.678168 |
+| 3 | 41.524326 | 41.255106 | 41.488068 | 41.775085 |
+| Total solve seconds | 128.524154 | 128.908797 | 128.423380 | 129.002982 |
+
+Mean solve time was **128.763568 s baseline** versus **128.666089 s changed**,
+a nominal 0.076% reduction. The first pair made the change 0.30%
+slower; the second made it 0.45% faster. CPU-time means were 127.578125 s
+baseline and 127.609375 s changed. These differences do not establish a
+reliable measurable speed improvement. The solver change was reverted and no
+follow-on optimization was attempted.
+
+- All four benchmarks passed unchanged board, 3BV, and optimal-click references:
+  36,000 timed solves and 1,200 warm-up solves over 3,000 distinct Expert boards.
+- An assertion-enabled harness compared the actual baseline predicate with
+  the changed predicate on 300,000 seeded cases. Coverage included one through
+  three signature words, empty signatures, random containment graphs,
+  constructed union/containment cases, bit 63, and 63-66 component boundaries.
+  Every predicate result matched, including the general fallback.
+- All non-timing JSON fields, exact replay actions, and four state/pruning
+  counter lines matched in 36 full-solver comparisons: three difficulties,
+  seeds 1, 42, 100, 2026, 123456, and 8675309, in both solve modes. All 18
+  changed replays passed built-in legal-action validation.
+
+Source snapshots, measured executables, temporary assertion harness and runner,
+comparison JSON/profile outputs, raw benchmark logs, and `results.json` are in
+the artifact directory above. The restored solver source matches the baseline
+snapshot byte-for-byte. Existing workspace edits and benchmark references were
+preserved; `doms.exe` was restored to the measured baseline build.
+
+## Experiment: reuse transformed crossing-count buffers
+
+Smart line ordering constructs two transformed scope histograms, then allocates
+and initializes a third array for the final crossing scores. Overwrite the
+before-only histogram with those scores and return it instead. Each result
+reads only the histogram entry at its own index and the separate after-only
+array, so all scores, ordering tie breaks, and complete orders are preserved.
+No objective, pruning certificate, or search limit changes.
+
+Include existing workspace edits in the baseline. Build with MSYS2 UCRT64 and
+identical C++17 optimization flags. Compare the actual smart-order functions
+and complete solver/replay results, then run sequential plain `--benchmark`
+invocations in baseline/changed/changed/baseline order. Retain only a measurable
+improvement; otherwise restore this experiment's solver change and stop.
+Temporary artifacts: `%TEMP%\doms-crossing-buffer-20261021`.
+
+### Results: reverted; no measurable speed improvement
+
+Both builds used MSYS2 UCRT64 GCC with identical
+`-std=c++17 -O3 -DNDEBUG -pthread` optimization flags. The changed build also
+used `-Wall -Wextra -Wpedantic` and compiled without diagnostics. Four plain
+`--benchmark` invocations ran sequentially in A/B/B/A order, with no compilation
+or other solver jobs from this session overlapping measurement. Each used
+one thread, a successful high-priority request, 100 warm-up boards per fixed
+set, and three timed repeats. Cells sum solve seconds across three repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 45.147510 | 44.963832 | 45.667321 | 45.710031 |
+| 2 | 43.806040 | 44.037965 | 44.254659 | 44.375132 |
+| 3 | 42.798461 | 43.120072 | 43.138976 | 43.232738 |
+| Total solve seconds | 131.752011 | 132.121869 | 133.060956 | 133.317901 |
+
+Mean solve time was **132.534956 s baseline** versus **132.591413 s changed**,
+a nominal **0.043% slowdown**. The first adjacent pair made the change 0.281%
+slower; the second made it 0.193% faster. Mean CPU times were 131.242188 s
+baseline and 131.140625 s changed. These differences do not establish a
+measurable speed improvement. The solver change was reverted and no follow-on
+optimization was attempted.
+
+- All four benchmarks passed unchanged board, 3BV, and optimal-click references:
+  36,000 timed solves and 1,200 warm-up solves over 3,000 distinct Expert boards.
+- An assertion-enabled harness extracted the actual baseline smart-order
+  function and compared it with the changed function on 300 seeded boards,
+  100 per standard difficulty, before and after candidate reduction. All
+  2,400 complete orders matched across both orientations and sweep directions.
+- All non-timing JSON fields, exact replay actions, and state/pruning counter
+  lines matched across 36 full-solver comparisons: three standard difficulties,
+  seeds 1, 42, 100, 2026, 123456, and 8675309, and both solve modes. All
+  18 changed replays passed built-in legal-action validation.
+
+Source snapshots, measured executables, temporary differential harness and
+runner, solver JSON/profile outputs, raw benchmark logs, and `results.json`
+are retained in the artifact directory above. Existing workspace edits and
+benchmark references were preserved. The restored solver source matches its
+baseline snapshot byte-for-byte; `doms.exe` is the measured baseline binary.
+
+## Experiment: cache opening-absorption component matches per transition
+
+Opening absorption repeatedly searches the same outgoing connectivity signature
+for each factor state. Cache each opening's matching component range once per
+incoming connectivity and branch, in a flat arena with stable offsets. Keep
+opening order, factor-bit checks, duplicate-component consumption, normalization,
+and successor insertion order unchanged. Omit openings with no matching component.
+Canonical signatures sort equal components contiguously, including wide signatures.
+No objective, dominance certificate, search limit, or benchmark reference changes.
+
+Build baseline and changed sources with identical MSYS2 UCRT64 C++17 flags.
+Compare component-range absorption against direct scans on randomized and boundary
+cases, then compare complete count-only/replay results and pruning counters.
+Run sequential plain --benchmark invocations in baseline/changed/changed/baseline
+order. Retain only a measurable improvement; otherwise revert this experiment's
+solver change and stop. Artifacts are outside version control under
+`%TEMP%\doms-union-merge-20261021` (the directory name predates candidate selection).
+
+### Results: reverted; no reliable measurable improvement
+
+Baseline and changed builds used MSYS2 UCRT64 GCC with identical
+`-std=c++17 -O3 -DNDEBUG -pthread` optimization flags. The changed build also
+used `-Wall -Wextra -Wpedantic` and compiled without diagnostics. All four
+invocations used plain `--benchmark`: one thread, high priority (successful),
+100 warm-up boards per fixed set, and three timed repeats. Runs were sequential
+A/B/B/A, with no compilation or other solver jobs from this session overlapping
+measurements. Cells sum solve seconds across the three timed repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 46.573818 | 45.143833 | 44.847931 | 44.689582 |
+| 2 | 44.708775 | 43.738616 | 43.759603 | 43.508036 |
+| 3 | 43.048748 | 42.822184 | 42.504429 | 41.751167 |
+| Total solve seconds | 134.331341 | 131.704633 | 131.111963 | 129.948785 |
+
+Mean solve time was **132.140063 s baseline** versus **131.408298 s changed**,
+a nominal **0.554% reduction**. However, the first adjacent pair favored the
+change by 1.96%, while the second favored baseline by 0.90%; every fixed set
+reversed direction between pairs. Baseline invocation totals drifted by 3.26%,
+well above the mean separation. Mean CPU times were 130.929688 s baseline and
+130.453125 s changed, also with contradictory adjacent pairs. These results do
+not establish a reliable measurable speed improvement. The solver change was
+reverted and no follow-on optimization was attempted. Peak memory was not measured.
+
+- All four benchmarks passed unchanged board, 3BV, and optimal-click references:
+  36,000 timed solves and 1,200 warm-ups over 3,000 distinct Expert boards.
+- An assertion-enabled temporary harness exercised the actual component-range
+  helper against independent direct scans on 30,000 seeded canonical signatures,
+  with 40 sequential opening operations per signature: 1,200,000 checks. It
+  covered one through four words, empty signatures, duplicate components, bit 63,
+  63/64/65/129-component boundaries, absent matches, exhausted ranges, and
+  repeated factor slots. Matching ranges, consumed components, and factor bits
+  agreed throughout.
+- All non-timing JSON fields, exact replay actions, and four state/pruning
+  counter lines matched across 36 baseline/changed comparisons: three standard
+  difficulties, seeds 1, 42, 100, 2026, 123456, and 8675309, in both solve modes.
+  All 18 changed replays passed built-in legal-action validation.
+
+Baseline/changed source snapshots, measured executables, temporary harness and
+comparison scripts, solver JSON/profile outputs, raw benchmark logs, and
+`results.json` are retained in the artifact directory above. The restored source
+matches its baseline snapshot byte-for-byte; `doms.exe` is the measured baseline
+binary. Benchmark reference data is unchanged. Only this experiment's plan and
+results remain as tracked changes.
+
+## Experiment: insert the merged one-word transition component in order
+
+For selected-chord transitions with one-word connectivity, all retained
+components are unchanged: components containing the current bit are consumed
+by the merge. Their canonical ascending order therefore survives filtering.
+Insert the single merged component with lower_bound instead of sorting the
+entire outgoing signature. Keep the skip branch and multiword path unchanged.
+Duplicates, closed-component counts, interned words, insertion order, replay
+ties, pruning certificates, objectives, and search limits remain unchanged.
+
+Build baseline and changed versions with identical MSYS2 UCRT64 C++17 flags.
+Compare the actual transition block on randomized/boundary signatures and
+compare full replay/count-only results and search counters. Run sequential
+plain --benchmark invocations in A/B/B/A order, retaining default warm-ups
+and three repeats. Retain only a measurable improvement; otherwise revert
+the solver change and stop. Preserve the existing optimization-plan edits.
+Temporary artifacts: %TEMP%\doms-sorted-transition-20261021.
+
+### Results: reverted; no measurable speed improvement
+
+Both builds used MSYS2 UCRT64 GCC 16.1.0 with identical
+`-std=c++17 -O3 -DNDEBUG -pthread` optimization flags. The changed build
+also enabled `-Wall -Wextra -Wpedantic` and compiled without diagnostics.
+Four plain `--benchmark` invocations ran sequentially in A/B/B/A order,
+with no compilation or other solver jobs from this session overlapping
+measurement. Each used one thread, high priority (successful), 100 warm-up
+boards per fixed set, and three timed repeats. Cells sum solve seconds
+across each fixed set's three repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 43.006921 | 43.168481 | 43.869174 | 42.949016 |
+| 2 | 42.013538 | 41.733076 | 43.859144 | 41.935347 |
+| 3 | 40.726993 | 40.376488 | 41.462104 | 40.791786 |
+| Total solve seconds | 125.747452 | 125.278045 | 129.190422 | 125.676149 |
+
+Mean solve time was **125.711801 s baseline** versus **127.234234 s changed**,
+a **1.21% slowdown**. The first adjacent pair favored the change by 0.37%,
+while the second favored baseline by 2.80%. Mean CPU times were 124.898438 s
+baseline and 126.312500 s changed. These measurements do not establish a
+speed improvement. The solver change was reverted and no follow-on
+optimization was attempted. Peak memory was not measured.
+
+- All four benchmarks passed unchanged board, 3BV, and optimal-click references:
+  36,000 timed solves plus 1,200 warm-up solves over 3,000 distinct Expert boards.
+- An assertion-enabled temporary harness extracted the actual baseline and
+  changed one-word transition blocks. All 600,000 branch results matched on
+  300,000 seeded canonical signatures, comparing outgoing words and closed
+  component counts. Cases included empty signatures, duplicate components,
+  zero future reach, absent current slots, bit 63, and component counts through
+  129, with both compact and direct future-neighbor sources.
+- All non-timing JSON fields, exact replay actions, and four search/pruning
+  counter lines matched in 36 full-solver comparisons: three difficulties;
+  seeds 1, 42, 100, 2026, 123456, and 8675309; count-only and replay modes.
+  All 18 changed replays passed the built-in legal-action validation.
+
+Baseline/changed source snapshots and executables, the extracted transition
+harness, runner, solver JSON/profile outputs, raw benchmark logs,
+`results.json`, and `summary.json` are outside version control under
+`%TEMP%\doms-sorted-transition-20261021`. Existing optimization-plan edits
+were preserved. The restored solver source matches its baseline snapshot
+byte-for-byte; `doms.exe` is the measured baseline binary. Benchmark reference
+data is unchanged. Only this experiment's plan and results remain as new
+tracked edits.
+
+## Experiment: flatten compact future-neighbor rows
+
+The compact-connectivity path stored one fixed-width future-neighbor bit row
+per candidate in `vector<vector<uint64_t>>`, causing one heap allocation per
+row. Store the same rows in one flat word vector and address each row by its
+fixed-width offset. Bit construction and transition order remain unchanged;
+the wide-connectivity representation is untouched. No objective, dominance
+certificate, search limit, or benchmark reference changes.
+
+Build baseline and changed sources with identical MSYS2 UCRT64 C++17 flags.
+Run plain `--benchmark` sequentially in baseline/changed/changed/baseline
+order. Keep the storage change only if the paired measurements show a
+measurable improvement; otherwise revert it and stop. Temporary source,
+binaries, and logs are under `%TEMP%\doms-flat-neighbors-20261021`.
+
+### Results: retained
+
+Both binaries used MSYS2 UCRT64 GCC 16.1.0 and identical
+`-std=c++17 -O3 -DNDEBUG -pthread` flags. The changed build also enabled
+`-Wall -Wextra -Wpedantic` and compiled without diagnostics. Four plain
+`--benchmark` invocations ran sequentially in A/B/B/A order. Each passed the
+fixed Expert references, using 100 warm-up boards per set and three timed
+repeats. No other solver or compilation jobs overlapped measurement. The
+cells below sum each set's solve seconds across its three timed repeats:
+
+| Fixed Expert set | Baseline 1 | Changed 1 | Changed 2 | Baseline 2 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 56.612283 | 56.092937 | 55.319535 | 56.309386 |
+| 2 | 55.822641 | 55.778040 | 54.705420 | 55.553878 |
+| 3 | 55.482039 | 55.309123 | 54.327239 | 55.506723 |
+| Total solve seconds | 167.916963 | 167.180100 | 164.352194 | 167.369987 |
+
+Mean solve time decreased from **167.643475 s to 165.766147 s (1.12%)**.
+Both adjacent pairs improved (0.44% and 1.81%), and all six corresponding
+fixed-set totals were lower with the flattened rows. The two changed runs
+were also mutually consistent with a 1.70% difference, while baseline totals
+differed by 0.33%.
+
+- All four runs passed unchanged board, 3BV, and optimal-click references:
+  36,000 timed solves and 1,200 warm-ups over 3,000 distinct Expert boards.
+- The representation change preserves each row's word order and exact bits;
+  it does not alter connectivity signatures or successor insertion order.
+- `git diff --check` passed. Benchmark reference data is unchanged.
+
+The source snapshot, both measured binaries, and raw benchmark logs are
+retained outside version control under `%TEMP%\doms-flat-neighbors-20261021`.
+
+## Follow-up candidate: exact separator decomposition for wide frontiers
+
+Investigate an alternate exact solve path for boards whose best available
+frontier order still has a large peak boundary. Build the decomposition over
+the complete dependency structure: chord adjacency, zero-scope propagation,
+and factor scopes must all be represented so that neither connectivity nor
+factor rewards are lost across a separator. The separator interface must carry
+the selected boundary choices, pending factor hits, and connectivity
+equivalence among boundary vertices; combine subproblem costs only after
+accounting for shared flags, base rewards, and seed components.
+
+Start with a prototype that only detects candidate separators and reports
+their sizes and projected state counts. Then implement a bounded-width exact
+composition for small separators and compare it differentially with the
+existing frontier DP. Benchmark separately on boards with wide frontiers and
+on the fixed Expert set; dispatch to it only when measured total work is lower.
+This is a larger algorithm change and is not part of the flat-row experiment.

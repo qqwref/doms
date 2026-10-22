@@ -45,9 +45,13 @@ With Clang, replace `g++` with `clang++`.
 
 Use a MinGW-w64 GCC toolchain, such as the MSYS2 UCRT64 environment:
 
-```console
-g++ -std=c++17 -O3 -DNDEBUG -pthread minesweeper_chord_dp.cpp -o doms.exe
+```powershell
+$env:PATH = 'C:\msys64\ucrt64\bin;' + $env:PATH
+g++ -std=c++17 -O3 -DNDEBUG -pthread .\minesweeper_chord_dp.cpp -o .\doms.exe
 ```
+
+Run these commands from the repository root. The PATH setting selects MSYS2's
+UCRT64 compiler instead of another installed `g++`.
 
 This Windows command uses a portable x86-64 instruction target. If the program
 crashes with a CPU-specific build, first rebuild without `-march=native` and
@@ -97,9 +101,9 @@ For machine-readable output:
 ./doms example.mbf --json > solution.json
 ```
 
-The solution is written to standard output. Timing, progress, and generated
-board information are written to standard error, so they do not corrupt JSON
-or click-tuple output.
+For single-board solves, the solution is written to standard output. Timing,
+progress, and generated board information are written to standard error, so
+they do not corrupt JSON or click-tuple output.
 
 ## Input formats
 
@@ -268,51 +272,67 @@ fewer threads if simultaneous difficult boards consume too much memory.
 
 ### Fixed single-thread benchmark
 
+Run from the repository root so the program can load
+`benchmarks/expert_benchmark_reference.csv`. On Windows PowerShell, use
+`.\doms.exe` instead of `./doms`.
+
 ```console
 ./doms --benchmark
+./doms --benchmark --benchmark-warmup 0 --benchmark-repeat 1
 ```
 
-This always runs three sets of 1,000 Expert boards (30 x 16, 99 mines),
-sequentially on one thread in count-only mode, using these seeds in order:
+The benchmark solves three fixed sets of 1,000 Expert boards (30 x 16, 99
+mines), sequentially on one thread in count-only mode, using these seeds:
 
 1. `15415727658250109428`
 2. `13781498123793209364`
 3. `1443274517951773430`
 
-Each run prints total elapsed seconds and median, p5, and p95 per-board solve
-seconds. Total time includes generation, solving, and reference validation;
-per-board times cover model construction and solving. Percentiles use linear
-interpolation. Each run samples a different fixed board set; rerunning the
-command repeats the same three sets.
+By default it requests high priority, warms up on the first 100 boards of each
+set once, then repeats the three sets three times in the order above: 9,000
+timed solves plus 300 warm-up solves. Priority elevation is best effort and
+prints a warning on failure. `--benchmark-warmup N` changes the warm-up count
+per set (capped at 1,000; `0` disables it). `--benchmark-repeat N` changes the
+number of timed repeats. The second command above runs exactly 3,000 solves.
+`--benchmark-cpu N` optionally pins the thread to zero-based logical CPU `N`
+on Windows or Linux; failure to pin exits with status `2`.
 
-Every board's PTTACG encoding, 3BV, and optimal click count must exactly match
-the committed references in `benchmarks/expert_benchmark_reference.csv`. These
-references were generated with full replay and legal-action validation enabled.
-A mismatch stops immediately with exit status `2`, identifying the seed, board
-index, and expected/actual values. A run prints `PASS` only after all 1,000
-boards match; timing values are allowed to vary. References are never updated
-by the benchmark.
+Every board's encoding, 3BV, and optimal click count must match the committed
+references, including during warm-up. A mismatch stops with exit status `2`
+and identifies the seed, board index, and expected/actual values. Each timing
+row prints `PASS` only after all 1,000 boards match. The benchmark never updates
+the references.
 
-`--progress`, `--order`, and `--band-size` are supported; all order choices must
-produce the same counts. `--count-only` is accepted explicitly. Other input
-modes, `--seed`, `--threads`, `--no-count-only`, `--profile`, `--json`, and
-`--click-tuples` cannot be combined with `--benchmark`.
+Each timed set reports wall time (including generation and validation), summed
+solve time, thread CPU solve time, and median/p5/p95 per-board solve times.
+Solve intervals cover model construction and solving. CPU time excludes time
+the thread is not running; unsupported platforms report zero. Percentiles use
+linear interpolation. An aggregate section reports median/minimum/maximum
+totals per set across repeats and `cv_solve_percent` (population standard
+deviation divided by mean solve time, as a percentage). Standard output mixes
+text with timing and aggregate tables; it is not a single CSV table.
+
+`--progress`, `--order`, `--band-size`, and explicit `--count-only` are supported.
+Other input modes, `--seed`, `--threads`, `--no-count-only`, `--profile`, `--json`,
+and `--click-tuples` cannot be combined with `--benchmark`.
 
 ### Fixed multithread benchmark
 
 ```console
 ./doms --benchmark-multi
+./doms --benchmark-multi --threads 4
 ```
 
-This runs the same three fixed sets of 1,000 Expert boards and validates every
-board against the same committed references, using one worker per available
-hardware thread (falling back to one). Set the worker count explicitly with
-`--threads N`, for example `./doms --benchmark-multi --threads 4`. Board
-generation is deterministic and happens before parallel solving, so every
-worker count receives the same boards. Total times include board generation
-and validation; per-board times cover model construction and solving. Parallel
-timings are affected by CPU and memory contention, and concurrent boards can
-use substantially more memory than the single-thread benchmark.
+This runs the same three fixed sets once each in count-only mode and validates
+against the same references. It uses one worker per available hardware thread
+(falling back to one); `--threads N` overrides the worker count. Generation
+happens before parallel solving, so every worker count receives the same boards.
+Each set reports total elapsed time and median/p5/p95 per-board solve times.
+Total time includes generation and validation; per-board times cover model
+construction and solving. Concurrent boards can use substantially more memory.
+
+This mode does not warm up, raise priority, or report repeat aggregates. It
+rejects `--benchmark-warmup`, `--benchmark-repeat`, and `--benchmark-cpu`.
 
 ## Output formats and coordinates
 
@@ -387,17 +407,20 @@ World of Minesweeper game URL, MBF filename, or quoted MBF hexadecimal.
 
 | Option | Meaning |
 | --- | --- |
-| `--benchmark` | Run three fixed sets of 1,000 Expert boards on one thread, validate every board and count against committed references, and report total/median/p5/p95 seconds for each run. |
+| `--benchmark` | Validate three fixed 1,000-board Expert sets on one thread; default: 100 warm-up boards/set, high priority, three repeats, timing rows and aggregate statistics. |
 | `--benchmark-multi` | Run the same fixed benchmark using available CPU threads; accepts `--threads N` to set the worker count. |
+| `--benchmark-warmup N` | Warm up on `N` boards per fixed set before timing; requires `--benchmark`; default `100`, and `0` disables it. |
+| `--benchmark-repeat N` | Run each fixed set `N` times and report aggregate median/min/max/CV statistics; requires `--benchmark`, default `3`. |
+| `--benchmark-cpu N` | Pin the single benchmark thread to logical CPU `N`; requires `--benchmark`. |
 | `--generate beginner\|intermediate\|expert` | Generate, print, and solve one random standard board. Do not also supply `BOARD`. |
 | `--bulk beginner\|intermediate\|expert\|evil\|NxM/K COUNT` | Generate and optimally solve `COUNT` boards. `evil` is `30x20/130`; custom sizes are width x height / mines, matching PTTACG. Writes per-board solve times in the CSV and median, p5, and p95 solve times to standard error. |
 | `--seed N` | Reproduce a generated board or complete bulk sequence. Requires `--generate` or `--bulk`. |
-| `--threads N` | Set the number of bulk solver threads; default uses `hardware_concurrency()`, with a fallback of one. Requires `--bulk`. |
+| `--threads N` | Set the worker count for `--bulk` or `--benchmark-multi`; default uses `hardware_concurrency()`, with a fallback of one. |
 | `--count-only` | Store only state costs and omit move reconstruction; default for bulk runs. |
 | `--no-count-only` | Reconstruct and validate moves; default for single boards. Bulk output remains CSV. |
 | `--order NAME` | Choose `auto` (the default) or any sweep order printed on the `DP:` line. Examples include `columns-reverse-smart`, `rows-reverse-band-2`, and `columns-reverse-dynamic`. See below for the naming rules. |
 | `--band-size N` | Force a fixed band width of `N` rows or columns. With `--order auto`, compare both orientations; with a plain row or column order, use that direction. |
-| `--progress` | Print frontier size and pruning progress for one board; print completed boards during bulk runs. |
+| `--progress` | Print frontier size and pruning progress for one board; print completed boards during bulk runs, or validation progress every 100 boards during benchmarks. Multithread benchmark progress is reported after each set finishes solving. |
 | `--profile` | Print phase timings, dominance details, and state/branch counts to standard error. Single boards only, including `--generate`; cannot be combined with `--bulk`. |
 | `--json` | Print machine-readable JSON. |
 | `--click-tuples` | Print only `(click_type, x, y)` tuples. |
@@ -575,9 +598,20 @@ connectivity tests. Sorted cost cutoffs stop scans once later witnesses cannot
 afford to dominate the target; the compensated pass skips targets already
 removed by coarsening dominance. During that pass it keeps a compact list of
 remaining targets, refreshes the cost bounds when targets are removed, and
-stops comparing a target signature once its list is empty. Dominated states
-remain available as witnesses until all passes finish, preserving the same
-exact pruning decisions.
+stops comparing a target signature once its list is empty. States removed by
+cross-connectivity dominance remain available as witnesses until all passes
+finish; identical-connectivity dominance retains only its survivors.
+
+Dominance setup's cached records point directly to stable DP table entries
+and derive the final sort field from their cached hit counts. On 64-bit builds
+this reduces each record from 48 to 32 bytes and reduces the data moved during
+sorting. Count-only mode also stores these records in one shared array, with
+a slice for each reachability bucket. Replay mode retains per-bucket buffers,
+which used less peak RSS with heap-backed chord histories in testing. Bucket
+sizes are accumulated while grouping signatures, avoiding a separate scan.
+Each bucket's connectivity-signature IDs also occupy a slice of one shared
+array, avoiding per-bucket allocations while preserving signature and witness
+order.
 
 Dominance setup's cached records point directly to stable DP table entries
 and derive the final sort field from their cached hit counts. On 64-bit builds
@@ -714,7 +748,9 @@ solver for discovering an unknown board without guessing.
 
 ## Development checks
 
-Run `./doms --benchmark` for the complete 3,000-board integration check.
+Run `./doms --benchmark` for repeated, validated optimization timing. Use
+`./doms --benchmark --benchmark-warmup 0 --benchmark-repeat 1` for a
+3,000-board integration check. Run benchmark commands from the repository root.
 
 Compile with warnings enabled:
 

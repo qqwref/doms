@@ -7,8 +7,10 @@
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -42,7 +44,9 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -964,8 +968,10 @@ static bool swap_dominated_candidate(const CandidateRelations& relations,
 // sets. A nonpositive maximum is therefore a proof that v is unnecessary.
 static bool left_click_dominated_candidate(const CandidateRelations& relations,
                                            int candidate,
-                                           const std::vector<int>& private_mine_counts) {
-    std::vector<int> adjacent;
+                                           const std::vector<int>& private_mine_counts,
+                                           std::vector<int>& adjacent,
+                                           std::vector<int>& base_ids) {
+    adjacent.clear();
     for (size_t word = 0; word < relations.propagation[candidate].size(); ++word) {
         uint64_t neighbors = relations.propagation[candidate][word];
         while (neighbors) {
@@ -977,7 +983,7 @@ static bool left_click_dominated_candidate(const CandidateRelations& relations,
     // ordinary standard boards. Skipping a larger neighborhood is conservative.
     if (adjacent.size() > 63) return false;
 
-    std::vector<int> base_ids;
+    base_ids.clear();
     for (size_t word = 0; word < relations.base_factors[candidate].size(); ++word) {
         uint64_t bases = relations.base_factors[candidate][word];
         while (bases) {
@@ -1055,23 +1061,13 @@ static CandidateReduction reduce_candidates(const Model& original, bool progress
         std::vector<uint8_t> keep(q, 1);
         int swaps_removed = 0;
         for (int victim = 0; victim < q; ++victim) {
-            // Only propagation neighbors can replace the victim. Enumerate
-            // their bits in ascending candidate order to preserve the first
-            // valid replacement and the batch's sequential deletion choices.
-            for (size_t word = 0; word < relations.propagation[victim].size(); ++word) {
-                uint64_t neighbors = relations.propagation[victim][word];
-                while (neighbors) {
-                    const int replacement = static_cast<int>(
-                        word * 64 + __builtin_ctzll(neighbors));
-                    neighbors &= neighbors - 1;
-                    if (keep[replacement] &&
-                        swap_dominated_candidate(relations, victim, replacement)) {
-                        keep[victim] = 0;
-                        ++swaps_removed;
-                        break;
-                    }
+            for (int replacement = 0; replacement < q; ++replacement) {
+                if (keep[replacement] &&
+                    swap_dominated_candidate(relations, victim, replacement)) {
+                    keep[victim] = 0;
+                    ++swaps_removed;
+                    break;
                 }
-                if (!keep[victim]) break;
             }
         }
         if (swaps_removed) {
@@ -1084,13 +1080,15 @@ static CandidateReduction reduce_candidates(const Model& original, bool progress
         }
         {
             std::vector<int> private_mine_counts(q, 0);
+            std::vector<int> adjacent;
+            std::vector<int> base_ids;
             for (const auto& scope : result.model.mine_scopes) {
                 if (scope.size() == 1) ++private_mine_counts[scope.front()];
             }
             int removed = 0;
             for (int candidate = 0; candidate < q; ++candidate) {
                 if (left_click_dominated_candidate(
-                        relations, candidate, private_mine_counts)) {
+                        relations, candidate, private_mine_counts, adjacent, base_ids)) {
                     keep[candidate] = 0;
                     ++removed;
                 }
@@ -1386,28 +1384,26 @@ static std::vector<int> smart_line_order_indices(const Model& model,
                 ++old_total;
             }
         }
-        subset_zeta(old_masks);
-        std::vector<uint32_t> same_line_neighbors(p, 0);
-        std::vector<uint8_t> has_later_neighbor(p, 0);
+        // A selected current-line vertex closes exactly when it has no later
+        // neighbor and its same-line neighbors have all been selected. Add
+        // its closed-neighborhood mask to the old-vertex histogram: one subset
+        // transform then counts both closed old and closed current vertices.
         for (int bit = 0; bit < p; ++bit) {
+            uint32_t closed_mask = uint32_t{1} << bit;
+            bool has_later_neighbor = false;
             for (int neighbor : model.graph[line[bit]]) {
                 const int neighbor_line = sweep_line(neighbor);
-                if (neighbor_line > line_number) has_later_neighbor[bit] = 1;
+                if (neighbor_line > line_number) has_later_neighbor = true;
                 else if (neighbor_line == line_number) {
-                    same_line_neighbors[bit] |= uint32_t{1} << local_bit[neighbor];
+                    closed_mask |= uint32_t{1} << local_bit[neighbor];
                 }
             }
+            if (!has_later_neighbor) ++old_masks[closed_mask];
         }
+        subset_zeta(old_masks);
         for (uint32_t mask = 0; mask < state_count; ++mask) {
-            graph_cost[mask] += old_always + old_total - old_masks[mask];
-            uint32_t selected = mask;
-            while (selected) {
-                const int bit = __builtin_ctz(selected);
-                selected &= selected - 1;
-                if (has_later_neighbor[bit] || (same_line_neighbors[bit] & ~mask & all)) {
-                    ++graph_cost[mask];
-                }
-            }
+            graph_cost[mask] += old_always + old_total + __builtin_popcount(mask) -
+                                old_masks[mask];
         }
 
         struct PathScore {
@@ -1425,22 +1421,31 @@ static std::vector<int> smart_line_order_indices(const Model& model,
         best[0] = {graph_cost[0] + factor_cost[0], graph_cost[0], factor_cost[0],
                    estimated_cut_work(graph_cost[0] + factor_cost[0])};
         for (uint32_t mask = 1; mask < state_count; ++mask) {
+            // Every predecessor pays the same cut cost. Keep the winning
+            // score local and publish it once, after considering every bit.
+            const int graph = graph_cost[mask];
+            const int factors = factor_cost[mask];
+            const int total = graph + factors;
+            const uint64_t cut_work = estimated_cut_work(total);
+            PathScore best_score;
+            int8_t best_bit = -1;
             uint32_t choices = mask;
             while (choices) {
                 const int bit = __builtin_ctz(choices);
                 choices &= choices - 1;
                 const uint32_t previous = mask ^ (uint32_t{1} << bit);
                 PathScore score = best[previous];
-                const int total = graph_cost[mask] + factor_cost[mask];
                 score.max_total = std::max(score.max_total, total);
-                score.max_graph = std::max(score.max_graph, graph_cost[mask]);
-                score.max_factors = std::max(score.max_factors, factor_cost[mask]);
-                score.work = saturated_add(score.work, estimated_cut_work(total));
-                if (predecessor[mask] < 0 || less_score(score, best[mask])) {
-                    best[mask] = score;
-                    predecessor[mask] = static_cast<int8_t>(bit);
+                score.max_graph = std::max(score.max_graph, graph);
+                score.max_factors = std::max(score.max_factors, factors);
+                score.work = saturated_add(score.work, cut_work);
+                if (best_bit < 0 || less_score(score, best_score)) {
+                    best_score = score;
+                    best_bit = static_cast<int8_t>(bit);
                 }
             }
+            best[mask] = best_score;
+            predecessor[mask] = best_bit;
         }
         std::vector<int> reversed;
         reversed.reserve(p);
@@ -2195,6 +2200,14 @@ public:
     iterator begin() { return iterator(this, 0); }
     iterator end() { return iterator(this, entries_.size()); }
 
+    // Completed layers only erase and iterate. Dense entry positions remain
+    // stable, so pruning no longer needs the duplicate-lookup index.
+    void release_lookup_index() {
+        std::vector<uint32_t>().swap(slots_);
+        used_slots_ = 0;
+        deleted_slots_ = 0;
+    }
+
     void reserve(size_t count) {
         if (count > static_cast<size_t>(DELETED) - 1) {
             throw std::length_error("too many DP states for the flat table");
@@ -2272,57 +2285,35 @@ public:
     std::pair<iterator, bool> find_or_emplace(State state, size_t state_hash,
                                            MakeRecord&& make_record) {
         if (slots_.empty()) reserve(live_size_ + 1);
-        // Probe before growing the index. Most generated successors can be
-        // duplicates, and those lookups do not need insertion capacity.
-        // Grow only after finding an empty slot for a genuinely new state.
-        // Reuse a tombstone without growing, since it does not increase the
-        // number of occupied slots.
+        ensure_insert_capacity();
+        const size_t mask = slots_.size() - 1;
+        size_t slot = state_hash & mask;
+        size_t first_deleted = std::numeric_limits<size_t>::max();
         for (;;) {
-            const size_t mask = slots_.size() - 1;
-            size_t slot = state_hash & mask;
-            size_t first_deleted = std::numeric_limits<size_t>::max();
-            for (;;) {
-                const uint32_t entry = slots_[slot];
-                if (entry == EMPTY) {
-                    if (first_deleted != std::numeric_limits<size_t>::max()) {
-                        slot = first_deleted;
-                        --deleted_slots_;
-                    } else {
-                        if ((used_slots_ + 1) * 4 > slots_.size() * 3) {
-                            ensure_insert_capacity();
-                            break;
-                        }
-                        ++used_slots_;
-                    }
-                    const size_t index = entries_.size();
-                    entries_.emplace_back(std::move(state), make_record());
-                    alive_.push_back(1);
-                    slots_[slot] = static_cast<uint32_t>(index);
-                    ++live_size_;
-                    return {iterator(this, index), true};
+            const uint32_t entry = slots_[slot];
+            if (entry == EMPTY) {
+                if (first_deleted != std::numeric_limits<size_t>::max()) {
+                    slot = first_deleted;
+                    --deleted_slots_;
+                } else {
+                    ++used_slots_;
                 }
-                if (entry == DELETED) {
-                    if (first_deleted == std::numeric_limits<size_t>::max()) {
-                        first_deleted = slot;
-                    }
-                } else if (alive_[entry] && entries_[entry].first == state) {
-                    return {iterator(this, entry), false};
-                }
-                slot = (slot + 1) & mask;
+                const size_t index = entries_.size();
+                entries_.emplace_back(std::move(state), make_record());
+                alive_.push_back(1);
+                slots_[slot] = static_cast<uint32_t>(index);
+                ++live_size_;
+                return {iterator(this, index), true};
             }
+            if (entry == DELETED) {
+                if (first_deleted == std::numeric_limits<size_t>::max()) {
+                    first_deleted = slot;
+                }
+            } else if (alive_[entry] && entries_[entry].first == state) {
+                return {iterator(this, entry), false};
+            }
+            slot = (slot + 1) & mask;
         }
-    }
-
-    // After duplicate merging, the layer is only pruned and iterated. Release
-    // its lookup index before allocating dominance scratch space. find() has
-    // a linear fallback, and a later insertion rebuilds the index if needed.
-    void discard_lookup_index() {
-        // Keep small indexes: freeing them early perturbs allocator reuse more
-        // than their cheap erasures save. Release indexes of at least 64 KiB.
-        if (slots_.size() < 16384) return;
-        std::vector<uint32_t>{}.swap(slots_);
-        used_slots_ = 0;
-        deleted_slots_ = 0;
     }
 
     // Pruning holds stable entry pointers: it never inserts into this table.
@@ -2421,9 +2412,11 @@ static uint64_t dominance_primary_key(int cost, int base_hits) {
 // every finer component's future reachability is contained in its representative.
 // Requiring every coarse component to represent at least one fine component
 // prevents an unmatched component from adding a future seed-click liability.
-static bool connectivity_coarsens(SignatureView coarse,
+template <size_t FixedWords>
+static bool connectivity_coarsens_impl(SignatureView coarse,
                                   SignatureView fine,
-                                  size_t signature_words) {
+                                  size_t runtime_words) {
+    const size_t signature_words = FixedWords ? FixedWords : runtime_words;
     const size_t coarse_count = coarse.size() / signature_words;
     const size_t fine_count = fine.size() / signature_words;
     if (coarse_count > fine_count) return false;
@@ -2436,12 +2429,10 @@ static bool connectivity_coarsens(SignatureView coarse,
     constexpr size_t kInlineComponents = 64;
     if (coarse_count <= kInlineComponents && fine_count <= kInlineComponents) {
         std::array<uint64_t, kInlineComponents> eligible{};
-        // A fine component without any containing coarse component makes
-        // matching impossible. Build one fine column at a time so this
-        // necessary condition can reject the pair before building the rest.
-        for (size_t f = 0; f < fine_count; ++f) {
-            bool represented = false;
-            for (size_t c = 0; c < coarse_count; ++c) {
+        uint64_t represented = 0;
+        for (size_t c = 0; c < coarse_count; ++c) {
+            uint64_t mask = 0;
+            for (size_t f = 0; f < fine_count; ++f) {
                 bool subset = true;
                 for (size_t word = 0; word < signature_words; ++word) {
                     const uint64_t fine_word = fine[f * signature_words + word];
@@ -2451,13 +2442,14 @@ static bool connectivity_coarsens(SignatureView coarse,
                         break;
                     }
                 }
-                if (subset) {
-                    eligible[c] |= uint64_t{1} << f;
-                    represented = true;
-                }
+                if (subset) mask |= uint64_t{1} << f;
             }
-            if (!represented) return false;
+            eligible[c] = mask;
+            represented |= mask;
         }
+        const uint64_t all_fine = fine_count == 64
+            ? ~uint64_t{0} : ((uint64_t{1} << fine_count) - 1);
+        if (represented != all_fine) return false;
 
         std::array<int, kInlineComponents> fine_match;
         fine_match.fill(-1);
@@ -2525,6 +2517,15 @@ static bool connectivity_coarsens(SignatureView coarse,
     return true;
 }
 
+// Standard frontiers fit in one word. A fixed word count lets the compiler
+// remove word loops and index multiplications without changing the matching.
+static bool connectivity_coarsens(SignatureView coarse,
+                                  SignatureView fine,
+                                  size_t signature_words) {
+    if (signature_words == 1) return connectivity_coarsens_impl<1>(coarse, fine, 1);
+    return connectivity_coarsens_impl<0>(coarse, fine, signature_words);
+}
+
 // For reverse dominance, require an exact quotient: each fine component has
 // one unambiguous coarse parent, and every coarse reach is precisely the union
 // of its assigned fine reaches. Merely being contained is insufficient: extra
@@ -2583,9 +2584,11 @@ static bool connectivity_exact_quotient(SignatureView coarse,
 // along their bipartite overlap graph to obtain a common coarsening J.
 // A needs at most count(A)-count(J) more future seeds than B: merging that
 // many components takes A to J, and J can only improve on B.
-static int connectivity_merge_penalty(SignatureView a,
+template <size_t FixedWords>
+static int connectivity_merge_penalty_impl(SignatureView a,
                                       SignatureView b,
-                                      size_t words) {
+                                      size_t runtime_words) {
+    const size_t words = FixedWords ? FixedWords : runtime_words;
     const int na = static_cast<int>(a.size() / words);
     const int nb = static_cast<int>(b.size() / words);
     if (na + nb > 128) return std::numeric_limits<int>::max();
@@ -2608,6 +2611,13 @@ static int connectivity_merge_penalty(SignatureView a,
         }
     }
     return na - groups;
+}
+
+static int connectivity_merge_penalty(SignatureView a,
+                                      SignatureView b,
+                                      size_t signature_words) {
+    if (signature_words == 1) return connectivity_merge_penalty_impl<1>(a, b, 1);
+    return connectivity_merge_penalty_impl<0>(a, b, signature_words);
 }
 
 template <typename FactorBits, bool TrackChosen>
@@ -2645,13 +2655,24 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
         CachedItem* end() { return data + count; }
         void push_back(CachedItem item) { data[count++] = item; }
     };
+    struct IdList {
+        uint32_t* data = nullptr;
+        size_t count = 0;
+        uint32_t* begin() const { return data; }
+        uint32_t* end() const { return data + count; }
+        size_t size() const { return count; }
+    };
     struct Bucket {
-        std::vector<uint32_t> connectivity_ids;
+        IdList connectivity_ids;
         std::conditional_t<TrackChosen, std::vector<CachedItem>, CachedList> entries;
         size_t state_count = 0;
         // If two future boundary positions occur together in a fine component,
         // a coarsening must contain them together in some component too.
-        std::unordered_map<uint16_t, std::vector<uint32_t>> pair_postings;
+        // Pair keys are (a << 6) | b for boundary bits a < b < 64.
+        // Allocate the direct index only for buckets that use postings;
+        // keep the posting vectors dense rather than constructing 4096 of them.
+        std::vector<int> pair_index;
+        std::vector<std::vector<uint32_t>> pair_postings;
     };
 
     const size_t connectivity_count = connectivity_pool.size();
@@ -2664,9 +2685,22 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
     // and coarsening dominance can then reuse one cached key and one sort per
     // union bucket instead of rebuilding and sorting the table twice.
     std::unordered_map<std::vector<uint64_t>, size_t, WordsHash> bucket_by_union;
-    std::unordered_map<uint64_t, size_t> bucket_by_word;
-    if (signature_words == 1) bucket_by_word.reserve(connectivity_count);
-    else bucket_by_union.reserve(connectivity_count);
+    // Scalar unions need only a temporary lookup index. Store bucket IDs in
+    // flat slots instead of allocating a hash node for every distinct union.
+    // At most connectivity_count keys can be inserted; keep load at most 1/2.
+    constexpr size_t no_bucket = std::numeric_limits<size_t>::max();
+    std::vector<size_t> word_slots;
+    std::vector<uint64_t> bucket_words;
+    if (signature_words == 1) {
+        size_t capacity = 8;
+        while (capacity / 2 < connectivity_count) {
+            if (capacity > std::numeric_limits<size_t>::max() / 2)
+                throw std::length_error("dominance union index capacity overflow");
+            capacity *= 2;
+        }
+        word_slots.assign(capacity, no_bucket);
+        bucket_words.reserve(connectivity_count);
+    } else bucket_by_union.reserve(connectivity_count);
     std::vector<Bucket> buckets;
     std::vector<size_t> connectivity_bucket(connectivity_count,
                                              std::numeric_limits<size_t>::max());
@@ -2681,9 +2715,18 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
             // signature order, just as on the multiword path.
             uint64_t combined = 0;
             for (uint64_t component : signature) combined |= component;
-            const auto result = bucket_by_word.emplace(combined, buckets.size());
-            bucket = result.first->second;
-            new_bucket = result.second;
+            const size_t mask = word_slots.size() - 1;
+            size_t slot = hash_combine(0, combined) & mask;
+            while (word_slots[slot] != no_bucket &&
+                   bucket_words[word_slots[slot]] != combined) {
+                slot = (slot + 1) & mask;
+            }
+            new_bucket = word_slots[slot] == no_bucket;
+            if (new_bucket) {
+                bucket = buckets.size();
+                bucket_words.push_back(combined);
+                word_slots[slot] = bucket;
+            } else bucket = word_slots[slot];
         } else {
             std::vector<uint64_t> combined(signature_words, 0);
             for (size_t offset = 0; offset < signature.size(); offset += signature_words) {
@@ -2697,12 +2740,27 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
         }
         if (new_bucket) buckets.emplace_back();
         connectivity_bucket[id] = bucket;
-        buckets[bucket].connectivity_ids.push_back(id);
+        ++buckets[bucket].connectivity_ids.count;
         buckets[bucket].state_count += state_counts[id];
+    }
+    // Assign disjoint slices before filling IDs in their original order.
+    // No per-bucket growth or allocation is needed, and slices stay stable.
+    std::vector<uint32_t> bucket_id_storage(connectivity_count);
+    size_t bucket_id_offset = 0;
+    for (auto& bucket : buckets) {
+        bucket.connectivity_ids.data = bucket_id_storage.data() + bucket_id_offset;
+        bucket_id_offset += bucket.connectivity_ids.count;
+        bucket.connectivity_ids.count = 0;
+    }
+    for (uint32_t id = 0; id < connectivity_count; ++id) {
+        if (state_counts[id] == 0) continue;
+        auto& ids = buckets[connectivity_bucket[id]].connectivity_ids;
+        ids.data[ids.count++] = id;
     }
     if (signature_words == 1) {
         for (auto& bucket : buckets) {
             if (bucket.connectivity_ids.size() < 64) continue;
+            bucket.pair_index.assign(4096, -1);
             for (uint32_t id : bucket.connectivity_ids) {
                 for (uint64_t component : connectivity_pool[id]) {
                     for (uint64_t outer = component; outer; outer &= outer - 1) {
@@ -2711,14 +2769,18 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                         while (inner) {
                             const int b = __builtin_ctzll(inner);
                             inner &= inner - 1;
-                            bucket.pair_postings[static_cast<uint16_t>((a << 6) | b)]
-                                .push_back(id);
+                            int& index = bucket.pair_index[(a << 6) | b];
+                            if (index < 0) {
+                                index = static_cast<int>(bucket.pair_postings.size());
+                                bucket.pair_postings.emplace_back();
+                            }
+                            bucket.pair_postings[index].push_back(id);
                         }
                     }
                 }
             }
             for (auto& posting : bucket.pair_postings) {
-                auto& ids = posting.second;
+                auto& ids = posting;
                 ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
             }
         }
@@ -2866,7 +2928,8 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
         if (survivors[fine_id].empty()) continue;
         coarser.clear();
         const auto& bucket = buckets[connectivity_bucket[fine_id]];
-        const std::vector<uint32_t>* candidate_ids = &bucket.connectivity_ids;
+        const uint32_t* candidate_begin = bucket.connectivity_ids.begin();
+        size_t candidate_count = bucket.connectivity_ids.size();
         if (!bucket.pair_postings.empty()) {
             for (uint64_t component : connectivity_pool[fine_id]) {
                 for (uint64_t outer = component; outer; outer &= outer - 1) {
@@ -2875,18 +2938,20 @@ static size_t prune_dominated(FactorTable<FactorBits, TrackChosen>& table,
                     while (inner) {
                         const int b = __builtin_ctzll(inner);
                         inner &= inner - 1;
-                        auto posting = bucket.pair_postings.find(
-                            static_cast<uint16_t>((a << 6) | b));
-                        if (posting != bucket.pair_postings.end() &&
-                            posting->second.size() < candidate_ids->size()) {
-                            candidate_ids = &posting->second;
+                        const int index = bucket.pair_index[(a << 6) | b];
+                        if (index >= 0 &&
+                            bucket.pair_postings[index].size() < candidate_count) {
+                            const auto& posting = bucket.pair_postings[index];
+                            candidate_begin = posting.data();
+                            candidate_count = posting.size();
                         }
                     }
                 }
             }
         }
-        coarser.reserve(candidate_ids->size());
-        for (uint32_t coarse_id : *candidate_ids) {
+        coarser.reserve(candidate_count);
+        for (size_t candidate_index = 0; candidate_index < candidate_count; ++candidate_index) {
+            const uint32_t coarse_id = candidate_begin[candidate_index];
             if (coarse_id == fine_id || survivors[coarse_id].empty()) continue;
             if (component_counts[coarse_id] > component_counts[fine_id]) continue;
             if (maximum_component_population[fine_id] >
@@ -3295,14 +3360,16 @@ static Solution solve_frontier_core(const Model& original_model,
     const bool compact_connectivity = connectivity_slot_last.size() <= 128;
     const size_t compact_signature_words =
         std::max<size_t>(1, (connectivity_slot_last.size() + 63) / 64);
-    std::vector<std::vector<uint64_t>> compact_future_neighbors;
+    std::vector<uint64_t> compact_future_neighbors;
     if (compact_connectivity) {
-        compact_future_neighbors.assign(q, std::vector<uint64_t>(compact_signature_words, 0));
+        compact_future_neighbors.assign(
+            static_cast<size_t>(q) * compact_signature_words, 0);
         for (int i = 0; i < q; ++i) {
             for (int candidate = i + 1; candidate < q; ++candidate) {
                 if (!test_bit(future_neighbors[i], candidate)) continue;
                 const int slot = connectivity_slot[candidate];
-                compact_future_neighbors[i][slot / 64] |= uint64_t{1} << (slot % 64);
+                compact_future_neighbors[static_cast<size_t>(i) * compact_signature_words +
+                                         slot / 64] |= uint64_t{1} << (slot % 64);
             }
         }
     }
@@ -3409,10 +3476,8 @@ static Solution solve_frontier_core(const Model& original_model,
             std::vector<uint64_t> merged(signature_words);
             std::vector<uint64_t> projected(signature_words);
             std::vector<uint64_t> canonical;
-            // Generation stamps avoid clearing one byte per component for
-            // every successor considered during opening-chain absorption.
-            std::vector<uint32_t> absorption_marks;
-            uint32_t absorption_generation = 0;
+            // Reuse component markers, clearing them for each successor.
+            std::vector<uint8_t> absorption_marks;
             for (const auto& [old_state, old_record] : table) {
                 if (!connectivity_ready[old_state.connectivity_id]) {
                     const auto& old_signature = connectivity_pool[old_state.connectivity_id];
@@ -3427,7 +3492,9 @@ static Solution solve_frontier_core(const Model& original_model,
                             const uint64_t current_bit = current_connectivity_slot >= 0
                                 ? uint64_t{1} << current_connectivity_slot : 0;
                             uint64_t merged_word = selected
-                                ? (compact_connectivity ? compact_future_neighbors[i][0]
+                                ? (compact_connectivity
+                                       ? compact_future_neighbors[
+                                             static_cast<size_t>(i) * compact_signature_words]
                                                         : future_neighbors[i][0])
                                 : 0;
                             outgoing_words.reserve(old_signature.size() + selected);
@@ -3458,7 +3525,11 @@ static Solution solve_frontier_core(const Model& original_model,
                         outgoing_offsets.reserve(old_component_count + selected);
                         if (selected) {
                             if (compact_connectivity) {
-                                merged = compact_future_neighbors[i];
+                                std::copy_n(
+                                    compact_future_neighbors.begin() +
+                                        static_cast<std::ptrdiff_t>(
+                                            static_cast<size_t>(i) * compact_signature_words),
+                                    compact_signature_words, merged.begin());
                             } else {
                                 for (size_t word = 0; word < chosen_words; ++word) {
                                     merged[word] = future_neighbors[i][word];
@@ -3604,12 +3675,7 @@ static Solution solve_frontier_core(const Model& original_model,
                         const size_t component_count = signature.size() / signature_words;
                         if (absorption_marks.size() < component_count)
                             absorption_marks.resize(component_count, 0);
-                        if (absorption_generation == std::numeric_limits<uint32_t>::max()) {
-                            std::fill(absorption_marks.begin(), absorption_marks.end(), 0);
-                            absorption_generation = 1;
-                        } else {
-                            ++absorption_generation;
-                        }
+                        std::fill(absorption_marks.begin(), absorption_marks.end(), 0);
                         bool changed = false;
                         for (const OpeningPattern& opening : opening_patterns[i]) {
                             if (!Ops::test(new_hits, opening.factor_slot)) continue;
@@ -3626,7 +3692,7 @@ static Solution solve_frontier_core(const Model& original_model,
                                     matched_component = static_cast<size_t>(
                                         match - signature.begin());
                                     while (matched_component < component_count &&
-                                           absorption_marks[matched_component] == absorption_generation &&
+                                           absorption_marks[matched_component] != 0 &&
                                            signature[matched_component] ==
                                                opening.remaining_border[0]) {
                                         ++matched_component;
@@ -3640,7 +3706,7 @@ static Solution solve_frontier_core(const Model& original_model,
                             } else {
                                 for (size_t component = 0; component < component_count;
                                      ++component) {
-                                    if (absorption_marks[component] == absorption_generation) continue;
+                                    if (absorption_marks[component] != 0) continue;
                                     const size_t offset = component * signature_words;
                                     bool equal = true;
                                     for (size_t word = 0; word < signature_words; ++word) {
@@ -3657,7 +3723,7 @@ static Solution solve_frontier_core(const Model& original_model,
                                 }
                             }
                             if (matched_component == component_count) continue;
-                            absorption_marks[matched_component] = absorption_generation;
+                            absorption_marks[matched_component] = 1;
                             Ops::clear(new_hits, opening.factor_slot);
                             ++new_cost;
                             ++opening_absorptions;
@@ -3668,7 +3734,7 @@ static Solution solve_frontier_core(const Model& original_model,
                             canonical.reserve(signature.size());
                             for (size_t component = 0; component < component_count;
                                  ++component) {
-                                if (absorption_marks[component] == absorption_generation) continue;
+                                if (absorption_marks[component] != 0) continue;
                                 const size_t offset = component * signature_words;
                                 canonical.insert(canonical.end(),
                                     signature.begin() + static_cast<std::ptrdiff_t>(offset),
@@ -3707,8 +3773,6 @@ static Solution solve_frontier_core(const Model& original_model,
             }
         }
 
-        next.discard_lookup_index();
-
         // The previous layer and connectivity pool are no longer needed. Release
         // them before dominance pruning so they do not overlap the largest
         // temporary structures of the new layer.
@@ -3731,6 +3795,7 @@ static Solution solve_frontier_core(const Model& original_model,
         // each pair, when both candidates' effects can be compared together.
         // The final candidate is always pruned, including an unpaired tail.
         const bool prune_now = (i % 2 == 1) || i + 1 == q;
+        if (prune_now) next.release_lookup_index();
         const auto prune_start = profile_enabled && prune_now
             ? std::chrono::steady_clock::now() : loop_start;
         const size_t removed = prune_now ? prune_dominated(
@@ -4180,6 +4245,9 @@ static void print_click_tuples(const Model& model, const Solution& solution) {
 struct Options {
     bool benchmark = false;
     bool benchmark_multi = false;
+    std::optional<size_t> benchmark_warmup;
+    std::optional<size_t> benchmark_repeat;
+    std::optional<size_t> benchmark_cpu;
     std::optional<std::string> board;
     std::optional<std::string> generate;
     std::optional<std::tuple<int, int, int>> bulk;
@@ -4202,8 +4270,11 @@ static void print_help(const char* program) {
         << "BOARD may be a PTTACG string, compatible LlamaSweeper URL,\n"
         << "World of Minesweeper game URL, MBF filename, or quoted MBF hex.\n\n"
         << "Options:\n"
-        << "  --benchmark                    Three fixed 1000-board Expert runs, one thread; validate counts\n"
+        << "  --benchmark                    Fixed Expert timing: warm-up, high priority, three repeats; validate counts\n"
         << "  --benchmark-multi              Same fixed benchmark using multiple threads\n"
+        << "  --benchmark-warmup N           Warm-up boards per set (default: 100; 0 disables)\n"
+        << "  --benchmark-repeat N           Timed repeats per fixed set (default: 3)\n"
+        << "  --benchmark-cpu N              Pin the single benchmark thread to logical CPU N\n"
         << "  --generate beginner|intermediate|expert\n"
         << "                                 Generate, print, and solve one random board\n"
         << "  --bulk beginner|intermediate|expert|evil|NxM/K COUNT\n"
@@ -4250,6 +4321,14 @@ static size_t parse_positive_size(const std::string& value, const std::string& o
     return static_cast<size_t>(parsed);
 }
 
+static size_t parse_nonnegative_size(const std::string& value, const std::string& option) {
+    const uint64_t parsed = parse_u64(value, option);
+    if (parsed > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        throw UserError(option + " is too large");
+    }
+    return static_cast<size_t>(parsed);
+}
+
 static Options parse_options(int argc, char** argv) {
     Options options;
     auto value_after = [&](int& i, const std::string& option) {
@@ -4266,6 +4345,12 @@ static Options parse_options(int argc, char** argv) {
             options.benchmark = true;
             options.benchmark_multi = true;
         }
+        else if (arg == "--benchmark-warmup")
+            options.benchmark_warmup = parse_nonnegative_size(value_after(i, arg), arg);
+        else if (arg == "--benchmark-repeat")
+            options.benchmark_repeat = parse_positive_size(value_after(i, arg), arg);
+        else if (arg == "--benchmark-cpu")
+            options.benchmark_cpu = parse_nonnegative_size(value_after(i, arg), arg);
         else if (arg == "--generate") options.generate = value_after(i, arg);
         else if (arg == "--bulk") {
             options.bulk = bulk_board_spec(value_after(i, arg));
@@ -4297,6 +4382,16 @@ static Options parse_options(int argc, char** argv) {
                             "cannot combine with BOARD, --generate, --bulk, --seed, incompatible --threads, "
                             "--json, --click-tuples, --profile, or --no-count-only");
         }
+    }
+    if (!options.benchmark &&
+        (options.benchmark_warmup || options.benchmark_repeat || options.benchmark_cpu)) {
+        throw UserError("--benchmark-warmup, --benchmark-repeat, and --benchmark-cpu "
+                        "require --benchmark");
+    }
+    if (options.benchmark_multi &&
+        (options.benchmark_warmup || options.benchmark_repeat || options.benchmark_cpu)) {
+        throw UserError("--benchmark-warmup, --benchmark-repeat, and --benchmark-cpu "
+                        "are not supported with --benchmark-multi");
     }
     if (options.generate && options.bulk) {
         throw UserError("choose only one of --generate and --bulk");
@@ -4409,6 +4504,164 @@ static void validate_benchmark_result(size_t run, size_t index, const std::strin
     }
 }
 
+struct BenchmarkSetResult {
+    double wall_seconds = 0.0;
+    double solve_seconds = 0.0;
+    double solve_cpu_seconds = 0.0;
+    std::vector<double> solve_times;
+};
+
+static bool benchmark_pin_to_cpu(size_t cpu) {
+#ifdef _WIN32
+    if (cpu >= sizeof(DWORD_PTR) * 8) return false;
+    return SetThreadAffinityMask(GetCurrentThread(),
+                                 static_cast<DWORD_PTR>(1) << cpu) != 0;
+#elif defined(__linux__)
+    if (cpu >= CPU_SETSIZE) return false;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    return sched_setaffinity(0, sizeof(set), &set) == 0;
+#else
+    (void)cpu;
+    return false;
+#endif
+}
+
+static bool benchmark_raise_priority() {
+#ifdef _WIN32
+    const bool process = SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS) != 0;
+    const bool thread = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0;
+    return process && thread;
+#elif defined(__linux__) || defined(__APPLE__)
+    return setpriority(PRIO_PROCESS, 0, -10) == 0;
+#else
+    return false;
+#endif
+}
+
+static double benchmark_thread_cpu_seconds() {
+#ifdef _WIN32
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    if (!GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user)) return 0.0;
+    ULARGE_INTEGER kernel_time, user_time;
+    kernel_time.LowPart = kernel.dwLowDateTime;
+    kernel_time.HighPart = kernel.dwHighDateTime;
+    user_time.LowPart = user.dwLowDateTime;
+    user_time.HighPart = user.dwHighDateTime;
+    return static_cast<double>(kernel_time.QuadPart + user_time.QuadPart) / 10000000.0;
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec time{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) != 0) return 0.0;
+    return static_cast<double>(time.tv_sec) + static_cast<double>(time.tv_nsec) / 1e9;
+#else
+    return 0.0;
+#endif
+}
+
+static BenchmarkSetResult run_benchmark_set(
+    size_t run, const Options& options,
+    const std::array<std::vector<BenchmarkReference>, 3>& references,
+    size_t board_limit, bool collect_times, bool report_progress,
+    const std::string& progress_label) {
+    BenchmarkSetResult result;
+    if (collect_times) result.solve_times.reserve(board_limit);
+    std::mt19937_64 rng(expert_benchmark::seeds[run]);
+    const auto start = std::chrono::steady_clock::now();
+    // Intentionally execute directly on this thread, without a worker pool.
+    for (size_t index = 0; index < board_limit; ++index) {
+        Board board = generate_standard_board("expert", rng);
+        const std::string encoded = format_pttacg_string(board);
+        const auto solve_start = std::chrono::steady_clock::now();
+        const double cpu_start = benchmark_thread_cpu_seconds();
+        Model model = build_model(board);
+        Solution solution = solve_frontier(model, options.order, options.band_size, false, true);
+        const auto solve_end = std::chrono::steady_clock::now();
+        const double cpu_end = benchmark_thread_cpu_seconds();
+        validate_benchmark_result(run, index, encoded, model.three_bv(), solution.clicks, references);
+        const double solve_seconds =
+            std::chrono::duration<double>(solve_end - solve_start).count();
+        result.solve_seconds += solve_seconds;
+        result.solve_cpu_seconds += cpu_end - cpu_start;
+        if (collect_times) result.solve_times.push_back(solve_seconds);
+        if (report_progress && ((index + 1) % 100 == 0)) {
+            std::cerr << progress_label << ": " << index + 1 << '/' << board_limit
+                      << " boards validated\n";
+        }
+    }
+    result.wall_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    if (collect_times) std::sort(result.solve_times.begin(), result.solve_times.end());
+    return result;
+}
+
+static void warm_up_benchmark(
+    const Options& options,
+    const std::array<std::vector<BenchmarkReference>, 3>& references,
+    size_t boards_per_set) {
+    if (boards_per_set == 0) return;
+    const size_t boards = std::min(boards_per_set,
+        static_cast<size_t>(expert_benchmark::board_count));
+    std::cerr << "Benchmark warm-up: " << boards << " boards per fixed set...\n";
+    for (size_t run = 0; run < expert_benchmark::seeds.size(); ++run) {
+        run_benchmark_set(run, options, references, boards, false, false, "");
+    }
+    std::cerr << "Benchmark warm-up complete.\n";
+}
+
+static double benchmark_mean(const std::vector<double>& values) {
+    if (values.empty()) return 0.0;
+    return std::accumulate(values.begin(), values.end(), 0.0) /
+           static_cast<double>(values.size());
+}
+
+static double benchmark_cv_percent(const std::vector<double>& values) {
+    if (values.size() < 2) return 0.0;
+    const double mean = benchmark_mean(values);
+    if (mean == 0.0) return 0.0;
+    double sum = 0.0;
+    for (double value : values) {
+        const double difference = value - mean;
+        sum += difference * difference;
+    }
+    return std::sqrt(sum / static_cast<double>(values.size())) / mean * 100.0;
+}
+
+static void print_benchmark_aggregates(
+    const std::array<std::vector<BenchmarkSetResult>, 3>& results) {
+    std::cout << "\naggregate_run,seed,repeats,median_wall_seconds,min_wall_seconds,"
+                 "max_wall_seconds,median_solve_seconds,min_solve_seconds,"
+                 "max_solve_seconds,median_cpu_seconds,min_cpu_seconds,"
+                 "max_cpu_seconds,cv_solve_percent\n";
+    const auto median = [](std::vector<double> values) {
+        std::sort(values.begin(), values.end());
+        return benchmark_percentile(values, 0.5);
+    };
+    for (size_t run = 0; run < results.size(); ++run) {
+        std::vector<double> wall;
+        std::vector<double> solve;
+        std::vector<double> cpu;
+        for (const auto& result : results[run]) {
+            wall.push_back(result.wall_seconds);
+            solve.push_back(result.solve_seconds);
+            cpu.push_back(result.solve_cpu_seconds);
+        }
+        if (solve.empty()) continue;
+        std::cout << run + 1 << ',' << expert_benchmark::seeds[run] << ','
+                  << solve.size() << ',' << std::fixed << std::setprecision(6)
+                  << median(wall) << ','
+                  << *std::min_element(wall.begin(), wall.end()) << ','
+                  << *std::max_element(wall.begin(), wall.end()) << ','
+                  << median(solve) << ','
+                  << *std::min_element(solve.begin(), solve.end()) << ','
+                  << *std::max_element(solve.begin(), solve.end()) << ','
+                  << median(cpu) << ','
+                  << *std::min_element(cpu.begin(), cpu.end()) << ','
+                  << *std::max_element(cpu.begin(), cpu.end()) << ','
+                  << std::setprecision(3) << benchmark_cv_percent(solve) << '\n';
+    }
+}
+
 static void run_benchmark(const Options& options) {
     const auto references = load_benchmark_references();
     if (options.benchmark_multi) {
@@ -4486,41 +4739,55 @@ static void run_benchmark(const Options& options) {
         std::cout << "Validated all 3000 boards against fixed board, 3BV, and optimal-click references.\n";
         return;
     }
+    const size_t warmup_boards = options.benchmark_warmup.value_or(100);
+    const size_t repeats = options.benchmark_repeat.value_or(3);
+    const bool high_priority = benchmark_raise_priority();
+    if (!high_priority) {
+        std::cerr << "Warning: could not raise benchmark priority.\n";
+    }
+    if (options.benchmark_cpu) {
+        const size_t cpu = *options.benchmark_cpu;
+        if (!benchmark_pin_to_cpu(cpu)) {
+            throw UserError("cannot pin benchmark thread to logical CPU " +
+                            std::to_string(cpu));
+        }
+        std::cerr << "Benchmark CPU affinity: logical CPU " << cpu << " (pinned)\n";
+    }
+    std::cerr << "Benchmark: single thread; warm-up " << warmup_boards
+              << " boards/set; repeats " << repeats << "; priority "
+              << (high_priority ? "high" : "default") << "\n";
+    warm_up_benchmark(options, references, warmup_boards);
+
     std::cout << "Expert benchmark: 3 runs x 1000 boards; single thread; count-only\n"
               << "Per-board times include model construction and solving; "
                  "percentiles use linear interpolation.\n"
-              << "run,seed,boards,total_seconds,median_seconds,p5_seconds,p95_seconds,validation\n";
-    for (size_t run = 0; run < expert_benchmark::seeds.size(); ++run) {
-        const uint64_t seed = expert_benchmark::seeds[run];
-        std::mt19937_64 rng(seed);
-        std::vector<double> solve_times;
-        solve_times.reserve(expert_benchmark::board_count);
-        const auto start = std::chrono::steady_clock::now();
-        // Intentionally execute directly on this thread, without a worker pool.
-        for (size_t index = 0; index < expert_benchmark::board_count; ++index) {
-            Board board = generate_standard_board("expert", rng);
-            const std::string encoded = format_pttacg_string(board);
-            const auto solve_start = std::chrono::steady_clock::now();
-            Model model = build_model(board);
-            Solution solution = solve_frontier(model, options.order, options.band_size, false, true);
-            const auto solve_end = std::chrono::steady_clock::now();
-            validate_benchmark_result(run, index, encoded, model.three_bv(), solution.clicks, references);
-            solve_times.push_back(std::chrono::duration<double>(solve_end - solve_start).count());
-            if (options.progress && ((index + 1) % 100 == 0)) {
-                std::cerr << "Benchmark run " << run + 1 << "/3, seed " << seed
-                          << ": " << index + 1 << "/1000 boards validated\n";
-            }
+              << "repeat,run,seed,boards,wall_seconds,solve_seconds,cpu_seconds,"
+                 "median_seconds,p5_seconds,p95_seconds,validation\n";
+    std::array<std::vector<BenchmarkSetResult>, 3> results;
+    for (size_t repeat = 0; repeat < repeats; ++repeat) {
+        for (size_t run = 0; run < expert_benchmark::seeds.size(); ++run) {
+            const uint64_t seed = expert_benchmark::seeds[run];
+            const std::string label = "Benchmark repeat " + std::to_string(repeat + 1) +
+                "/" + std::to_string(repeats) + ", run " +
+                std::to_string(run + 1) + "/3, seed " + std::to_string(seed);
+            BenchmarkSetResult result = run_benchmark_set(
+                run, options, references, expert_benchmark::board_count,
+                true, options.progress, label);
+            results[run].push_back(result);
+            std::cout << repeat + 1 << ',' << run + 1 << ',' << seed << ','
+                      << result.solve_times.size() << ',' << std::fixed
+                      << std::setprecision(6) << result.wall_seconds << ','
+                      << result.solve_seconds << ',' << result.solve_cpu_seconds << ','
+                      << benchmark_percentile(result.solve_times, 0.50) << ','
+                      << benchmark_percentile(result.solve_times, 0.05) << ','
+                      << benchmark_percentile(result.solve_times, 0.95)
+                      << ",PASS\n" << std::flush;
         }
-        const double total = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - start).count();
-        std::sort(solve_times.begin(), solve_times.end());
-        std::cout << run + 1 << ',' << seed << ',' << solve_times.size() << ','
-                  << std::fixed << std::setprecision(6) << total << ','
-                  << benchmark_percentile(solve_times, 0.50) << ','
-                  << benchmark_percentile(solve_times, 0.05) << ','
-                  << benchmark_percentile(solve_times, 0.95) << ",PASS\n" << std::flush;
     }
-    std::cout << "Validated all 3000 boards against fixed board, 3BV, and optimal-click references.\n";
+    print_benchmark_aggregates(results);
+    std::cout << "Validated all "
+              << repeats * expert_benchmark::seeds.size() * expert_benchmark::board_count
+              << " boards against fixed board, 3BV, and optimal-click references.\n";
 }
 
 int main(int argc, char** argv) {
