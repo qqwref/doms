@@ -620,8 +620,6 @@ sorting. Count-only mode also stores these records in one shared array, with
 a slice for each reachability bucket. Replay mode retains per-bucket buffers,
 which used less peak RSS with heap-backed chord histories in testing. Bucket
 sizes are accumulated while grouping signatures, avoiding a separate scan.
-See the [transition and setup benchmark notes](benchmarks/transition_setup_results.md)
-for measured timings, memory usage, test boards, and validation details.
 
 The common connectivity-matching path builds eligibility one fine component
 at a time. If a fine component has no containing coarse component, it rejects
@@ -745,27 +743,3 @@ a long time. Useful responses are:
 The solver assumes that all mine locations are already known and that flags may
 be placed before their neighboring numbered squares are opened. It is not a
 solver for discovering an unknown board without guessing.
-
-## Development checks
-
-Run `./doms --benchmark` for repeated, validated optimization timing. Use
-`./doms --benchmark --benchmark-warmup 0 --benchmark-repeat 1` for a
-3,000-board integration check. Run benchmark commands from the repository root.
-
-Compile with warnings enabled:
-
-```console
-g++ -std=c++17 -O3 -DNDEBUG -pthread -Wall -Wextra -Wpedantic minesweeper_chord_dp.cpp -o doms
-```
-
-Compile with AddressSanitizer and UndefinedBehaviorSanitizer:
-
-```console
-g++ -std=c++17 -O1 -g -pthread -fsanitize=address,undefined -fno-omit-frame-pointer minesweeper_chord_dp.cpp -o doms_san
-```
-
-Run representative PTTACG and MBF boards through both builds and compare their
-optimal click counts. Replay mode automatically checks that its action count
-matches the DP result and simulates the moves to confirm that all safe cells
-are opened legally. Compare count-only and replay results as well. Tied
-optimal solutions may use different action sequences.
