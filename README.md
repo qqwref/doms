@@ -263,6 +263,15 @@ to set the number of worker threads, including `--threads 1` for sequential
 execution. Board generation uses a single RNG on the main thread, so a seed
 produces the same boards and CSV row order at every thread count.
 
+Beginner (`9x9/10`) and Intermediate (`16x16/40`) runs automatically use a
+lighter ordering search: compare the four plain row/column sweep directions.
+The DP still finds the exact optimum. Multithreaded bulk runs of these sizes
+use batches of up to 1,024 boards (or the worker count, if larger), reducing
+thread launches and waits between batches. Equivalent custom-size inputs get
+the same behavior. Larger boards retain the full automatic ordering search
+and smaller batches. Explicit `--order` and `--band-size` choices override
+the ordering shortcut.
+
 For a single board, replay remains the default. Use `--count-only` to print
 only the optimal click count and DP statistics. `--no-count-only` enables
 reconstruction and validation during bulk runs too. Count-only JSON omits move
@@ -643,7 +652,9 @@ also been removed. Removing the cap can reduce total runtime and memory by
 preventing avoidable states from accumulating in later layers. It does not
 guarantee a faster solve on every board, and it does not change exactness.
 
-For `--order auto`, the program evaluates row, column, and promising banded
+For `--order auto` on standard Beginner and Intermediate boards, the program
+compares the four plain sweep directions; this also applies to single-board
+input. For other boards, it evaluates row, column, and promising banded
 orders in all four sweep directions: left-to-right, right-to-left,
 top-to-bottom, and bottom-to-top. The final selection minimizes **estimated
 peak total width plus estimated peak connectivity width**, then peak total
@@ -661,8 +672,8 @@ Smart line ordering combines current-line scopes into the before/after subset
 histograms, using two transforms instead of three for each crossing-cost
 calculation. Every crossing score and ordering tie break remains identical.
 
-Automatic ordering also tries bands whose widths change across the board. It
-computes the frontier profile for each contiguous band of one through eight
+The full automatic ordering search also tries bands whose widths change across
+the board. It computes the frontier profile for each contiguous band of one through eight
 rows or columns, then uses a short dynamic program to choose band boundaries.
 The three optimization passes minimize peak estimated width, peak connectivity
 width, and accumulated estimated work, in that order. A selected order such as

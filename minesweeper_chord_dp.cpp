@@ -623,6 +623,11 @@ static std::tuple<int, int, int> standard_board_spec(const std::string& difficul
     return {height, width, mine_count};
 }
 
+static bool is_small_standard_board(int height, int width, size_t mine_count) {
+    return (height == 9 && width == 9 && mine_count == 10) ||
+           (height == 16 && width == 16 && mine_count == 40);
+}
+
 static std::tuple<int, int, int> bulk_board_spec(const std::string& spec) {
     if (spec == "evil") return {20, 30, 130};
     if (spec == "beginner" || spec == "intermediate" || spec == "expert") {
@@ -4233,6 +4238,15 @@ static Solution solve_frontier(const Model& original_model,
     CandidateReduction reduction = reduce_candidates(original_model, progress);
     const auto ordering_start = profile_enabled ? std::chrono::steady_clock::now() :
         std::chrono::steady_clock::time_point{};
+    // On typical standard Beginner and Intermediate boards, the full smart/dynamic
+    // search costs more than it saves in the DP. Compare four plain sweeps
+    // instead. Explicit order/band requests still take precedence; the DP
+    // remains exact regardless of which processing order is selected.
+    if (requested_order == "auto" && !band_size &&
+        is_small_standard_board(original_model.height, original_model.width,
+                                original_model.mine_cells.size())) {
+        band_size = 1;
+    }
     auto [model, order_name] = choose_order(
         reduction.model, requested_order, band_size);
     const auto factor_start = profile_enabled ? std::chrono::steady_clock::now() : ordering_start;
@@ -5165,6 +5179,14 @@ int main(int argc, char** argv) {
             const size_t workers = std::min(options.bulk_count,
                 options.threads.value_or(detected ? detected : 1));
             const bool count_only = options.count_only.value_or(true);
+            const auto [height, width, mine_count] = *options.bulk;
+            // Amortize thread creation and reduce waits for the last board in
+            // each batch. Keep the existing small batches for sequential runs
+            // and larger boards, whose solves can take much longer.
+            const size_t batch_capacity = workers > 1 &&
+                is_small_standard_board(height, width, mine_count)
+                ? std::max<size_t>(1024, workers)
+                : workers * std::min<size_t>(8, 64 / workers + 1);
             std::cerr << "Bulk RNG: std::mt19937_64; seed: " << master_seed << "\n";
             std::cerr << "Bulk workers: " << workers << "; "
                       << (count_only ? "count-only" : "full replay") << " mode\n";
@@ -5176,7 +5198,7 @@ int main(int argc, char** argv) {
             // main thread. This preserves the seeded sequence and CSV row order.
             for (size_t begin = 0; begin < options.bulk_count;) {
                 const size_t batch = std::min(options.bulk_count - begin,
-                                              workers * std::min<size_t>(8, 64 / workers + 1));
+                                              batch_capacity);
                 struct Job {
                     Board board;
                     std::string encoded;
