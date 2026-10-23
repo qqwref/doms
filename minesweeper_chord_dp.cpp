@@ -5325,8 +5325,12 @@ int main(int argc, char** argv) {
                        generated_url, imported_url);
             return 0;
         }
-        std::cout << "Optimal clicks: " << solution.clicks << " (3BV without chording: "
-                  << model.three_bv() << ")\n";
+        std::ostringstream efficiency;
+        efficiency << std::fixed << std::setprecision(3)
+                   << (100.0 * model.three_bv() / solution.clicks) << "%";
+        std::cout << "Optimal clicks: " << solution.clicks << " (3BV: "
+                  << model.three_bv() << ", Efficiency: " << efficiency.str()
+				  << ")\n";
         if (!solution.count_only) std::cout
                   << "Breakdown: " << solution.flags.size() << " flags + "
                   << solution.components.size() << " seed left-clicks + "
